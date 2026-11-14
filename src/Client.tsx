@@ -8,6 +8,11 @@ import {
   Mic,
   Activity,
   BatteryCharging,
+  Power,
+  PowerOff,
+  Moon,
+  Sun,
+  EyeOff,
 } from 'lucide-react';
 import {
   setupPassiveAudio,
@@ -124,8 +129,10 @@ export const Client: React.FC<ClientProps> = ({
   });
 
   const [peerStatus, setPeerStatus] = useState<
-    'INITIALIZING' | 'AUTO_DISCOVERY' | 'CONNECTED'
+    'INITIALIZING' | 'AUTO_DISCOVERY' | 'CONNECTED' | 'DISCONNECTED'
   >('INITIALIZING');
+  const [isDarkStealthMode, setIsDarkStealthMode] = useState<boolean>(false);
+  const [isOledBlackout, setIsOledBlackout] = useState<boolean>(false);
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
   const [micStatus, setMicStatus] = useState<'READY' | 'DENIED' | 'PENDING'>('PENDING');
   const [audioRms, setAudioRms] = useState<number>(0);
@@ -171,6 +178,8 @@ export const Client: React.FC<ClientProps> = ({
   const isRemoteDescReadyRef = useRef<boolean>(false);
   const isHandshakingRef = useRef<boolean>(false);
   const isConnectedRef = useRef<boolean>(false);
+  const isManualDisconnectedRef = useRef<boolean>(false);
+  const connectWsFnRef = useRef<(() => void) | null>(null);
   const lastOfferSentAtRef = useRef<number>(0);
 
   // Fallback PeerJS refs
@@ -753,7 +762,7 @@ export const Client: React.FC<ClientProps> = ({
     let autoOfferInterval: number | null = null;
 
     const connectSignalingWebSocket = () => {
-      if (!isMounted) return;
+      if (!isMounted || isManualDisconnectedRef.current) return;
       if (
         wsRef.current &&
         (wsRef.current.readyState === WebSocket.OPEN ||
@@ -771,7 +780,7 @@ export const Client: React.FC<ClientProps> = ({
         wsRef.current = ws;
 
         ws.onopen = async () => {
-          if (!isMounted) return;
+          if (!isMounted || isManualDisconnectedRef.current) return;
           setPeerStatus((prev) =>
             prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'
           );
@@ -800,7 +809,7 @@ export const Client: React.FC<ClientProps> = ({
         };
 
         ws.onmessage = async (event) => {
-          if (!isMounted) return;
+          if (!isMounted || isManualDisconnectedRef.current) return;
           let data: SignalingMessage | null = null;
           try {
             data = JSON.parse(event.data) as SignalingMessage;
@@ -944,10 +953,14 @@ export const Client: React.FC<ClientProps> = ({
 
         ws.onclose = () => {
           if (!isMounted) return;
+          isConnectedRef.current = false;
+          if (isManualDisconnectedRef.current) {
+            setPeerStatus('DISCONNECTED');
+            return;
+          }
           console.warn(
             '[CLIENT-WS] Koneksi WebSocket terputus. Mencoba reconnect dalam 2.5 detik...'
           );
-          isConnectedRef.current = false;
           setPeerStatus('AUTO_DISCOVERY');
           wsReconnectTimer = window.setTimeout(
             connectSignalingWebSocket,
@@ -962,16 +975,19 @@ export const Client: React.FC<ClientProps> = ({
           } catch {}
         };
       } catch {
-        wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 3000);
+        if (!isManualDisconnectedRef.current) {
+          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 3000);
+        }
       }
     };
 
+    connectWsFnRef.current = connectSignalingWebSocket;
+
     const initializeSamsungSequentialFlow = async () => {
+      if (isManualDisconnectedRef.current) return;
       console.log(
         '[CLIENT-BOOT] Langkah 1a & 1b: Mengambil getUserMedia(...) (maks tunggu 1.5s agar tidak memblokir koneksi)...'
       );
-      // Tunggu getUserMedia maksimal 1.5 detik; jika pengguna Samsung/Oppo masih melihat popup izin mikrofon,
-      // tetap lanjutkan ke langkah 1c & 1d, dan begitu izin mikrofon diberikan langsung re-offer!
       const micPromise = ensureMicrophoneStream();
       const initialStream = await Promise.race([
         micPromise,
@@ -979,7 +995,7 @@ export const Client: React.FC<ClientProps> = ({
           setTimeout(() => resolve(null), 1500)
         ),
       ]);
-      if (!isMounted) return;
+      if (!isMounted || isManualDisconnectedRef.current) return;
 
       console.log(
         '[CLIENT-BOOT] Langkah 1c: Membuat new RTCPeerConnection(...) & addTransceiver...'
@@ -991,12 +1007,10 @@ export const Client: React.FC<ClientProps> = ({
       );
       connectSignalingWebSocket();
 
-      // Jika getUserMedia baru selesai setelah pengguna menekan "Allow" pada dialog Samsung/Oppo,
-      // langsung pasangkan stream mikrofon tersebut dan kirim Offer baru ke Master!
       if (!initialStream) {
         micPromise
           .then((delayedStream) => {
-            if (isMounted && delayedStream) {
+            if (isMounted && delayedStream && !isManualDisconnectedRef.current) {
               console.log(
                 '[CLIENT-BOOT] Mikrofon diizinkan! Mengirim Offer ulang dengan track audio aktif...'
               );
@@ -1010,7 +1024,7 @@ export const Client: React.FC<ClientProps> = ({
 
       // Interval 5 detik untuk Auto-Reconnect & Re-Offer secara senyap apabila belum terhubung
       autoOfferInterval = window.setInterval(async () => {
-        if (!isMounted) return;
+        if (!isMounted || isManualDisconnectedRef.current) return;
 
         if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
           connectSignalingWebSocket();
@@ -1055,13 +1069,14 @@ export const Client: React.FC<ClientProps> = ({
 
     // Listener pasif pada interaksi layar pertama (untuk membuka kunci AudioContext / getUserMedia di Oppo ColorOS & Samsung Internet)
     const unlockOnTouch = () => {
+      if (isManualDisconnectedRef.current) return;
       if (passivePipelineRef.current?.audioContext.state === 'suspended') {
         passivePipelineRef.current.audioContext.resume().catch(() => {});
       }
       if (!rawStreamRef.current || !rawStreamRef.current.active) {
         ensureMicrophoneStream()
           .then((s) => {
-            if (s && isMounted) {
+            if (s && isMounted && !isManualDisconnectedRef.current) {
               lastOfferSentAtRef.current = 0;
               startWebRTC();
             }
@@ -1171,105 +1186,381 @@ export const Client: React.FC<ClientProps> = ({
     };
   }, [transmitTelemetryPacket]);
 
-  /**
-   * ============================================================================
-   * TAMPILAN KLIEN 100% PASIF & ZERO-TOUCH (TANPA TOMBOL INTERAKTIF SAMA SEKALI)
-   * ============================================================================
-   * Sesuai spesifikasi: tidak ada tombol Connect, tidak ada klik/tap manual.
-   * Klien otomatis mencari Master setiap 5 detik dan langsung mengunci layar pasif.
-   */
-  if (peerStatus === 'CONNECTED') {
+  // 8. Tombol Interaksi Manual KONEK & DISKONEK (Memudahkan aktivasi mic & koneksi di Samsung, Oppo, dan POCO)
+  const handleManualConnect = useCallback(async () => {
+    isManualDisconnectedRef.current = false;
+    isHandshakingRef.current = false;
+    lastOfferSentAtRef.current = 0;
+    setPeerStatus('AUTO_DISCOVERY');
+
+    requestWakeLock();
+
+    if (passivePipelineRef.current?.audioContext.state === 'suspended') {
+      passivePipelineRef.current.audioContext.resume().catch(() => {});
+    }
+
+    // 1. Akuisisi mikrofon langsung di dalam event klik pengguna (membuka izin hardware Samsung & Oppo 100%)
+    const stream = await ensureMicrophoneStream();
+
+    // 2. Buat RTCPeerConnection baru dengan stream mikrofon
+    const pc = createSamsungSafePeerConnection(stream);
+
+    // 3. Buka WebSocket atau gunakan WebSocket yang sudah terbuka untuk registrasi & kirim Offer
+    if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+      connectWsFnRef.current?.();
+    } else if (wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'register',
+          id: nodeId,
+        })
+      );
+      transmitTelemetryPacket();
+      await sendOfferOverWebSocket(pc, wsRef.current);
+    }
+  }, [
+    createSamsungSafePeerConnection,
+    ensureMicrophoneStream,
+    nodeId,
+    requestWakeLock,
+    sendOfferOverWebSocket,
+    transmitTelemetryPacket,
+  ]);
+
+  const handleManualDisconnect = useCallback(() => {
+    isManualDisconnectedRef.current = true;
+    isConnectedRef.current = false;
+    isHandshakingRef.current = false;
+    setPeerStatus('DISCONNECTED');
+
+    // Beri tahu Master bahwa Klien ini memutuskan koneksi secara manual
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'client_disconnected',
+            senderId: nodeId,
+            targetId: 'MASTER',
+          })
+        );
+      } catch {}
+    }
+
+    if (nativeDcRef.current) {
+      try {
+        nativeDcRef.current.close();
+      } catch {}
+      nativeDcRef.current = null;
+    }
+
+    if (nativePcRef.current) {
+      try {
+        nativePcRef.current.onicecandidate = null;
+        nativePcRef.current.onconnectionstatechange = null;
+        nativePcRef.current.oniceconnectionstatechange = null;
+        nativePcRef.current.close();
+      } catch {}
+      nativePcRef.current = null;
+    }
+
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {}
+      wsRef.current = null;
+    }
+  }, [nodeId]);
+
+  // Mode Layar Hitam Total (OLED Blackout 0%): Ketuk 2x pada layar gelap untuk menampilkan kembali kontrol
+  if (isOledBlackout) {
     return (
-      <div className="fixed inset-0 bg-black text-neutral-900 flex flex-col justify-between p-4 select-none pointer-events-none z-[9999] font-mono-tactical">
-        <div className="flex items-center justify-between opacity-20">
-          <div className="flex items-center gap-2">
-            <img
-              src={LOGO_TNI_AU}
-              alt="TNI AU"
-              referrerPolicy="no-referrer"
-              className="w-5 h-5 object-contain rounded-full"
-            />
-            <span className="text-[10px] tracking-widest text-neutral-700">
-              S.I.G.M.A PASSIVE NODE // {nodeId}
-            </span>
-          </div>
-          <img
-            src={LOGO_PETIR}
-            alt="Diskomlekau"
-            referrerPolicy="no-referrer"
-            className="w-5 h-5 object-contain rounded-full"
-          />
+      <div
+        onDoubleClick={() => setIsOledBlackout(false)}
+        onClick={() => {}}
+        className="fixed inset-0 bg-black text-neutral-950 flex flex-col justify-between p-4 select-none z-[9999] font-mono-tactical cursor-pointer"
+        title="Ketuk 2x (Double Tap) untuk keluar dari Mode Layar Mati OLED"
+      >
+        <div className="flex items-center justify-between opacity-10">
+          <span className="text-[9px] tracking-widest text-neutral-700">
+            {nodeId} · {peerStatus}
+          </span>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsOledBlackout(false);
+            }}
+            className="px-2 py-0.5 text-[9px] border border-neutral-800 text-neutral-600 rounded"
+          >
+            BUKA LAYAR
+          </button>
         </div>
-
-        <div className="my-auto text-center space-y-1 opacity-15">
-          <div className="text-xs tracking-[0.3em] text-neutral-700">
-            PASSIVE TELEMETRY LOCKED · ZERO-TOUCH LINK ACTIVE
-          </div>
-          <div className="text-[10px] text-neutral-800">
-            GAIN: {remoteAudioState.gain.toFixed(1)}x · MIC:{' '}
-            {remoteAudioState.muted ? 'REMOTE MUTED' : 'LIVE'} · WAKE LOCK:{' '}
-            {wakeLockActive ? 'ON' : 'OFF'}
-          </div>
+        <div className="my-auto text-center text-[9px] text-neutral-900 tracking-widest">
+          MODE GELAP OLED AKTIF (KETUK 2X UNTUK MEMBUKA KONTROL)
         </div>
-
-        <div className="text-center text-[9px] tracking-widest text-neutral-900">
-          100% AUTO-CONNECTED TO MASTER · REMOTE CONTROLLED
-        </div>
+        <div className="h-2" />
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-black text-slate-400 font-mono-tactical flex flex-col justify-between p-4 sm:p-6 select-none pointer-events-none">
-      {/* Header Pasif: Logo TNI AU di Pojok Kiri Atas & Logo Petir di Pojok Kanan Atas */}
-      <div className="flex items-center justify-between gap-2 border-b border-neutral-900 pb-3">
+    <div
+      className={`min-h-screen font-mono-tactical flex flex-col justify-between p-4 sm:p-6 select-none transition-colors duration-200 ${
+        isDarkStealthMode
+          ? 'bg-black text-neutral-500'
+          : 'bg-[#030812] text-slate-300'
+      }`}
+    >
+      {/* Header: Logo TNI AU di Pojok Kiri Atas & Logo Petir di Pojok Kanan Atas */}
+      <div
+        className={`flex items-center justify-between gap-2 border-b pb-3 ${
+          isDarkStealthMode ? 'border-neutral-900' : 'border-cyan-500/30'
+        }`}
+      >
         <div className="flex items-center gap-2.5">
           <img
             src={LOGO_TNI_AU}
             alt="Logo TNI AU"
             referrerPolicy="no-referrer"
-            className="w-6 h-6 object-contain rounded-full border border-cyan-500/30 bg-black shrink-0"
+            className={`w-6 h-6 object-contain rounded-full border bg-black shrink-0 ${
+              isDarkStealthMode ? 'border-neutral-800 opacity-40' : 'border-cyan-500/40'
+            }`}
           />
-          <span className="text-xs tracking-widest text-neutral-500">
-            S.I.G.M.A // ZERO-TOUCH PASSIVE CLIENT
+          <span
+            className={`text-xs tracking-widest font-semibold ${
+              isDarkStealthMode ? 'text-neutral-600' : 'text-cyan-300'
+            }`}
+          >
+            S.I.G.M.A // CLIENT TRANSMITTER
           </span>
         </div>
 
-        <img
-          src={LOGO_PETIR}
-          alt="Logo Petir Diskomlekau"
-          referrerPolicy="no-referrer"
-          className="w-6 h-6 object-contain rounded-full border border-cyan-500/30 bg-black shrink-0"
-        />
+        <div className="flex items-center gap-2">
+          {/* Tombol Toggle Mode Gelap Redup */}
+          <button
+            type="button"
+            onClick={() => setIsDarkStealthMode((prev) => !prev)}
+            className={`flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold rounded border transition-colors cursor-pointer ${
+              isDarkStealthMode
+                ? 'bg-neutral-950 border-neutral-800 text-amber-400 hover:bg-neutral-900'
+                : 'bg-slate-900/90 border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/20'
+            }`}
+            title="Ubah Mode Gelap / Redup Taktis"
+          >
+            {isDarkStealthMode ? (
+              <>
+                <Sun className="w-3.5 h-3.5 text-amber-400" />
+                <span>MODE NORMAL</span>
+              </>
+            ) : (
+              <>
+                <Moon className="w-3.5 h-3.5 text-cyan-400" />
+                <span>MODE GELAP</span>
+              </>
+            )}
+          </button>
+
+          {/* Tombol Layar Hitam OLED Total */}
+          <button
+            type="button"
+            onClick={() => setIsOledBlackout(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold rounded border transition-colors cursor-pointer ${
+              isDarkStealthMode
+                ? 'bg-neutral-950 border-neutral-800 text-neutral-400 hover:bg-neutral-900'
+                : 'bg-slate-900/90 border-cyan-500/40 text-slate-300 hover:bg-cyan-500/20'
+            }`}
+            title="Sembunyikan Layar Hitam Total (OLED Blackout)"
+          >
+            <EyeOff className="w-3.5 h-3.5 text-cyan-400" />
+            <span className="hidden sm:inline">LAYAR GELAP TOTAL</span>
+          </button>
+
+          <img
+            src={LOGO_PETIR}
+            alt="Logo Petir Diskomlekau"
+            referrerPolicy="no-referrer"
+            className={`w-6 h-6 object-contain rounded-full border bg-black shrink-0 ${
+              isDarkStealthMode ? 'border-neutral-800 opacity-40' : 'border-cyan-500/40'
+            }`}
+          />
+        </div>
       </div>
 
-      {/* Status Auto-Discovery & Handshake (Tanpa Tombol Interaktif) */}
-      <div className="my-auto max-w-md w-full mx-auto space-y-5 py-6">
-        <div className="border border-neutral-900 bg-neutral-950/50 rounded p-6 text-center space-y-3">
-          <div className="flex items-center justify-center gap-2 text-xs text-cyan-500 tracking-widest">
-            <Radio className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-            <span>AUTO-DISCOVERY &amp; HANDSHAKE ACTIVE</span>
+      {/* Panel Utama Status & Tombol Interaksi KONEK / DISKONEK */}
+      <div className="my-auto max-w-md w-full mx-auto space-y-4 py-4">
+        <div
+          className={`border rounded p-5 text-center space-y-3 transition-colors ${
+            isDarkStealthMode
+              ? 'border-neutral-900 bg-neutral-950/60'
+              : peerStatus === 'CONNECTED'
+              ? 'border-emerald-500/50 bg-[#041512]/90'
+              : peerStatus === 'DISCONNECTED'
+              ? 'border-rose-500/40 bg-[#14070a]/80'
+              : 'border-cyan-500/35 bg-[#050d1a]/90'
+          }`}
+        >
+          <div className="flex items-center justify-center gap-2 text-xs tracking-widest">
+            <Radio
+              className={`w-3.5 h-3.5 ${
+                peerStatus === 'CONNECTED'
+                  ? 'text-emerald-400 animate-pulse'
+                  : peerStatus === 'DISCONNECTED'
+                  ? 'text-rose-400'
+                  : 'text-cyan-400 animate-pulse'
+              }`}
+            />
+            <span
+              className={
+                peerStatus === 'CONNECTED'
+                  ? 'text-emerald-400 font-bold'
+                  : peerStatus === 'DISCONNECTED'
+                  ? 'text-rose-400 font-bold'
+                  : 'text-cyan-400 font-bold'
+              }
+            >
+              {peerStatus === 'CONNECTED'
+                ? 'TERHUBUNG KE MASTER (ONLINE)'
+                : peerStatus === 'DISCONNECTED'
+                ? 'TERPUTUS (MANUAL DISCONNECT)'
+                : 'MENGHUBUNGKAN KE MASTER...'}
+            </span>
           </div>
 
-          <div className="text-5xl sm:text-6xl font-bold tracking-widest text-cyan-400 font-mono-tactical">
+          <div
+            className={`text-4xl sm:text-5xl font-bold tracking-widest font-mono-tactical ${
+              isDarkStealthMode
+                ? 'text-neutral-400'
+                : peerStatus === 'CONNECTED'
+                ? 'text-emerald-300'
+                : 'text-cyan-400'
+            }`}
+          >
             {nodeId}
           </div>
 
           <div className="text-[11px] text-neutral-400">
-            MENGIRIM OFFER OTOMATIS KE <span className="text-cyan-300">target: &quot;master&quot;</span> SETIAP 5 DETIK...
+            {peerStatus === 'CONNECTED' ? (
+              <span>
+                TRANSMISI AUDIO &amp; GPS AKTIF KE{' '}
+                <span className="text-emerald-300">MASTER</span>
+              </span>
+            ) : peerStatus === 'DISCONNECTED' ? (
+              <span>
+                KONEKSI DIPUTUSKAN · TEKAN TOMBOL <span className="text-cyan-300">KONEK</span> UNTUK MENYAMBUNGKAN
+              </span>
+            ) : (
+              <span>
+                AUTO-DISCOVERY &amp; HANDSHAKE KE <span className="text-cyan-300">MASTER</span>
+              </span>
+            )}
+          </div>
+
+          {/* TOMBOL INTERAKSI UTAMA: KONEK & DISKONEK + MODE GELAP */}
+          <div className="pt-3 grid grid-cols-2 gap-3">
+            <button
+              type="button"
+              onClick={handleManualConnect}
+              className={`flex items-center justify-center gap-2 py-3 px-4 rounded font-bold text-xs tracking-wider border transition-all cursor-pointer ${
+                isDarkStealthMode
+                  ? 'bg-neutral-900 border-emerald-800/70 text-emerald-400 hover:bg-neutral-800'
+                  : 'bg-emerald-500/25 hover:bg-emerald-500/40 border-emerald-400 text-emerald-200 shadow-[0_0_16px_rgba(16,185,129,0.25)]'
+              }`}
+            >
+              <Power className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>{peerStatus === 'CONNECTED' ? 'RE-KONEK' : 'KONEK MASTER'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleManualDisconnect}
+              disabled={peerStatus === 'DISCONNECTED'}
+              className={`flex items-center justify-center gap-2 py-3 px-4 rounded font-bold text-xs tracking-wider border transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                isDarkStealthMode
+                  ? 'bg-neutral-900 border-rose-900/70 text-rose-400 hover:bg-neutral-800'
+                  : 'bg-rose-500/20 hover:bg-rose-500/35 border-rose-400 text-rose-200'
+              }`}
+            >
+              <PowerOff className="w-4 h-4 text-rose-400 shrink-0" />
+              <span>DISKONEK</span>
+            </button>
+          </div>
+
+          {/* Baris Tombol Mode Gelap & Samarkan Layar */}
+          <div className="grid grid-cols-2 gap-3 pt-1">
+            <button
+              type="button"
+              onClick={() => setIsDarkStealthMode((prev) => !prev)}
+              className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded text-[11px] font-semibold border transition-colors cursor-pointer ${
+                isDarkStealthMode
+                  ? 'bg-neutral-900 border-amber-500/40 text-amber-300'
+                  : 'bg-slate-900/90 border-cyan-500/35 text-cyan-200 hover:bg-cyan-500/15'
+              }`}
+            >
+              {isDarkStealthMode ? (
+                <>
+                  <Sun className="w-3.5 h-3.5 text-amber-400" />
+                  <span>MATIKAN MODE GELAP</span>
+                </>
+              ) : (
+                <>
+                  <Moon className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>AKTIFKAN MODE GELAP</span>
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => TacticalBlackout.engage()}
+              className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded text-[11px] font-semibold border transition-colors cursor-pointer ${
+                isDarkStealthMode
+                  ? 'bg-neutral-900 border-neutral-800 text-neutral-300'
+                  : 'bg-slate-900/90 border-cyan-500/35 text-cyan-200 hover:bg-cyan-500/15'
+              }`}
+              title="Layar Hitam Total (Ketuk 5x Cepat untuk Keluar)"
+            >
+              <EyeOff className="w-3.5 h-3.5 text-cyan-400" />
+              <span>BLACKOUT (5x TAP)</span>
+            </button>
           </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2.5 text-xs">
-          <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
+          <div
+            className={`border p-3 rounded space-y-1 ${
+              isDarkStealthMode
+                ? 'border-neutral-900 bg-black'
+                : 'border-cyan-500/25 bg-[#040b16]'
+            }`}
+          >
             <div className="text-[10px] text-neutral-500">SIGNALING STATUS</div>
             <div className="flex items-center gap-2 font-semibold text-cyan-400">
-              <span className="w-2 h-2 rounded-full bg-cyan-500 animate-ping" />
-              <span>AUTO-RETRY (5s)</span>
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  peerStatus === 'CONNECTED'
+                    ? 'bg-emerald-400 animate-ping'
+                    : peerStatus === 'DISCONNECTED'
+                    ? 'bg-rose-500'
+                    : 'bg-cyan-500 animate-ping'
+                }`}
+              />
+              <span>
+                {peerStatus === 'CONNECTED'
+                  ? 'LINK LOCKED'
+                  : peerStatus === 'DISCONNECTED'
+                  ? 'STANDBY / OFF'
+                  : 'AUTO-RETRY (5s)'}
+              </span>
             </div>
           </div>
 
-          <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
+          <div
+            className={`border p-3 rounded space-y-1 ${
+              isDarkStealthMode
+                ? 'border-neutral-900 bg-black'
+                : 'border-cyan-500/25 bg-[#040b16]'
+            }`}
+          >
             <div className="text-[10px] text-neutral-500">WAKE LOCK</div>
             <div className="flex items-center gap-1.5 font-semibold text-neutral-300">
               <Lock className="w-3.5 h-3.5 text-cyan-500" />
@@ -1277,7 +1568,13 @@ export const Client: React.FC<ClientProps> = ({
             </div>
           </div>
 
-          <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
+          <div
+            className={`border p-3 rounded space-y-1 ${
+              isDarkStealthMode
+                ? 'border-neutral-900 bg-black'
+                : 'border-cyan-500/25 bg-[#040b16]'
+            }`}
+          >
             <div className="text-[10px] text-neutral-500">AMBIENT MIC STREAM</div>
             <div className="flex items-center gap-1.5 font-semibold text-neutral-300">
               <Mic className="w-3.5 h-3.5 text-cyan-500" />
@@ -1285,13 +1582,19 @@ export const Client: React.FC<ClientProps> = ({
                 {micStatus === 'READY'
                   ? `CAPTURED (${remoteAudioState.gain.toFixed(1)}x)`
                   : micStatus === 'DENIED'
-                  ? 'MIC BLOCKED'
+                  ? 'TAP KONEK U/ MIC'
                   : 'CAPTURING...'}
               </span>
             </div>
           </div>
 
-          <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
+          <div
+            className={`border p-3 rounded space-y-1 ${
+              isDarkStealthMode
+                ? 'border-neutral-900 bg-black'
+                : 'border-cyan-500/25 bg-[#040b16]'
+            }`}
+          >
             <div className="text-[10px] text-neutral-500">BATTERY TELEMETRY</div>
             <div className="flex items-center gap-1.5 font-semibold text-neutral-300">
               <BatteryCharging className="w-3.5 h-3.5 text-cyan-500" />
@@ -1302,7 +1605,13 @@ export const Client: React.FC<ClientProps> = ({
           </div>
         </div>
 
-        <div className="border border-neutral-900 bg-black p-3 rounded space-y-2">
+        <div
+          className={`border p-3 rounded space-y-2 ${
+            isDarkStealthMode
+              ? 'border-neutral-900 bg-black'
+              : 'border-cyan-500/25 bg-[#040b16]'
+          }`}
+        >
           <div className="flex items-center justify-between text-[11px] text-neutral-500">
             <span className="flex items-center gap-1.5">
               <Activity className="w-3.5 h-3.5 text-cyan-500" />
@@ -1318,7 +1627,13 @@ export const Client: React.FC<ClientProps> = ({
           </div>
         </div>
 
-        <div className="border border-neutral-900 bg-black p-3 rounded space-y-1.5 text-[11px]">
+        <div
+          className={`border p-3 rounded space-y-1.5 text-[11px] ${
+            isDarkStealthMode
+              ? 'border-neutral-900 bg-black'
+              : 'border-cyan-500/25 bg-[#040b16]'
+          }`}
+        >
           <div className="flex items-center justify-between text-neutral-500">
             <span className="flex items-center gap-1.5">
               <Navigation className="w-3.5 h-3.5 text-cyan-500" />
@@ -1342,10 +1657,16 @@ export const Client: React.FC<ClientProps> = ({
         </div>
       </div>
 
-      <div className="border-t border-neutral-900 pt-3 flex items-center justify-between text-[11px] text-neutral-600">
+      <div
+        className={`border-t pt-3 flex items-center justify-between text-[11px] ${
+          isDarkStealthMode
+            ? 'border-neutral-900 text-neutral-700'
+            : 'border-cyan-500/20 text-neutral-500'
+        }`}
+      >
         <div className="flex items-center gap-1.5">
-          <ShieldAlert className="w-3.5 h-3.5 text-neutral-600" />
-          <span>ZERO-TOUCH AUTO-CONNECT · TIDAK MEMERLUKAN INTERAKSI KLIK/TAP</span>
+          <ShieldAlert className="w-3.5 h-3.5 text-cyan-500/60" />
+          <span>AUTO-CONNECT + KONTROL MANUAL KONEK/DISKONEK &amp; MODE GELAP</span>
         </div>
         <span>RETRY: 5000ms</span>
       </div>

@@ -2,6 +2,64 @@
 <html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      (function () {
+        var NativeWS = window.WebSocket;
+        if (!NativeWS) return;
+        function ViteSafeWebSocket(url, protocols) {
+          var protoStr = Array.isArray(protocols)
+            ? protocols.join(',')
+            : String(protocols || '');
+          var urlStr = String(url || '');
+          if (
+            protoStr.indexOf('vite-hmr') !== -1 ||
+            protoStr.indexOf('vite-ping') !== -1 ||
+            urlStr.indexOf('token=') !== -1
+          ) {
+            var fakeTarget = new EventTarget();
+            fakeTarget.url = urlStr;
+            fakeTarget.readyState = 1; // OPEN
+            fakeTarget.protocol = protoStr;
+            fakeTarget.send = function () {};
+            fakeTarget.close = function () {
+              fakeTarget.readyState = 3;
+            };
+            setTimeout(function () {
+              var openEv = new Event('open');
+              if (typeof fakeTarget.onopen === 'function') fakeTarget.onopen(openEv);
+              fakeTarget.dispatchEvent(openEv);
+              var msgEv = new MessageEvent('message', {
+                data: JSON.stringify({ type: 'connected' }),
+              });
+              if (typeof fakeTarget.onmessage === 'function') fakeTarget.onmessage(msgEv);
+              fakeTarget.dispatchEvent(msgEv);
+            }, 10);
+            return fakeTarget;
+          }
+          return protocols !== undefined
+            ? new NativeWS(url, protocols)
+            : new NativeWS(url);
+        }
+        ViteSafeWebSocket.prototype = NativeWS.prototype;
+        ViteSafeWebSocket.CONNECTING = NativeWS.CONNECTING;
+        ViteSafeWebSocket.OPEN = NativeWS.OPEN;
+        ViteSafeWebSocket.CLOSING = NativeWS.CLOSING;
+        ViteSafeWebSocket.CLOSED = NativeWS.CLOSED;
+        window.WebSocket = ViteSafeWebSocket;
+
+        window.addEventListener('unhandledrejection', function (e) {
+          if (
+            e &&
+            e.reason &&
+            String(e.reason.message || e.reason).indexOf(
+              'WebSocket closed without opened'
+            ) !== -1
+          ) {
+            e.preventDefault();
+          }
+        });
+      })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>S.I.G.M.A. Remote Audio Telemetry Dashboard</title>
     <meta name="description" content="Tactical peer-to-peer WebRTC remote environmental audio telemetry, GPS tracking, and VOX automatic recording system." />
