@@ -23,6 +23,7 @@ import { Client } from './Client';
 import { PWAInstallButton, OfflineIndicator } from './PWAInstallButton';
 import { BarcodeModal } from './BarcodeModal';
 import { TacticalBlackout } from './TacticalBlackout';
+import { initUniversalRoleAssignment } from './dynamicRoleAssignment';
 
 type AppRole = 'LANDING' | 'MASTER' | 'NODE';
 
@@ -31,8 +32,13 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const m = params.get('mode')?.toUpperCase();
     if (m === 'MASTER') return 'MASTER';
-    if (m === 'NODE') return 'NODE';
+    if (m === 'NODE' || m === 'CLIENT') return 'NODE';
     return 'LANDING';
+  });
+
+  const [manualOverride, setManualOverride] = useState<boolean>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return Boolean(params.get('mode'));
   });
 
   const [pairedNodeId, setPairedNodeId] = useState<string | undefined>(() => {
@@ -53,6 +59,32 @@ export default function App() {
 
   const [clock, setClock] = useState<string>('18:21:54:00');
 
+  // Dynamic Role Assignment: Saat aplikasi dimuat, kirim { type: "REQUEST_ROLE" } ke WebSocket
+  useEffect(() => {
+    if (manualOverride) return;
+
+    const initMasterMode = () => {
+      setRole('MASTER');
+    };
+
+    const initClientMode = (info: { peerId: string; masterId: string | null }) => {
+      if (/^\d{4}$/.test(info.peerId)) {
+        setPairedNodeId(info.peerId);
+      }
+      setRole('NODE');
+    };
+
+    const roleClient = initUniversalRoleAssignment({
+      peerId: pairedNodeId,
+      initMasterMode,
+      initClientMode,
+    });
+
+    return () => {
+      roleClient.disconnect();
+    };
+  }, [manualOverride, pairedNodeId]);
+
   useEffect(() => {
     let raf: number;
     const updateClock = () => {
@@ -72,7 +104,12 @@ export default function App() {
     return (
       <>
         <OfflineIndicator />
-        <Master onExit={() => setRole('LANDING')} />
+        <Master
+          onExit={() => {
+            setManualOverride(true);
+            setRole('LANDING');
+          }}
+        />
       </>
     );
   }
@@ -82,7 +119,10 @@ export default function App() {
       <>
         <OfflineIndicator />
         <Client
-          onExit={() => setRole('LANDING')}
+          onExit={() => {
+            setManualOverride(true);
+            setRole('LANDING');
+          }}
           initialNodeId={pairedNodeId}
           initialMasterPeerId={pairedMasterId}
         />

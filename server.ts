@@ -10,9 +10,11 @@ const __dirname = path.dirname(__filename);
 
 interface SignalingMessage {
   type: string;
-  role?: 'master' | 'client';
+  role?: 'master' | 'client' | 'MASTER' | 'CLIENT';
   senderId?: string;
   nodeId?: string;
+  peerId?: string;
+  clientId?: string;
   target?: string;
   sdp?: unknown;
   candidate?: unknown;
@@ -32,12 +34,18 @@ async function startServer() {
   const server = http.createServer(app);
   const PORT = Number(process.env.PORT) || 3000;
 
-  // WebSocket Signaling Server for 1-Master to Multi-Client (up to 5 Clients) Auto-Discovery
+  // ============================================================================
+  // 1. LOGIKA SIGNALING SERVER (NODE.JS / WEBSOCKET) — DYNAMIC ROLE ASSIGNMENT
+  // ============================================================================
   const wss = new WebSocketServer({ noServer: true });
   const clientsMap = new Map<string, TrackedSocket>();
   const masterSockets = new Set<WebSocket>();
 
-  // In-memory HTTP signaling message queue fallback (for networks blocking WS upgrades)
+  // Variabel pelacak status Master tunggal
+  let masterId: string | null = null;
+  let masterSocket: WebSocket | null = null;
+
+  // In-memory HTTP signaling message queue fallback
   const httpMailboxes = new Map<string, SignalingMessage[]>();
   let masterLastSeenAt = 0;
 
@@ -52,7 +60,6 @@ async function startServer() {
     const protocolHeader = request.headers['sec-websocket-protocol'] || '';
     const reqUrl = request.url || '/';
 
-    // Handle Vite HMR WebSocket gracefully if an old client tab requests it
     if (protocolHeader.includes('vite-hmr')) {
       wss.handleUpgrade(request, socket, head, (ws) => {
         if (ws.readyState === WebSocket.OPEN) {
@@ -71,8 +78,8 @@ async function startServer() {
     }
   });
 
-  const sendSafe = (targetWs: WebSocket, payload: unknown) => {
-    if (targetWs.readyState === WebSocket.OPEN) {
+  const sendSafe = (targetWs: WebSocket | null | undefined, payload: unknown) => {
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
       try {
         targetWs.send(JSON.stringify(payload));
       } catch {}
@@ -85,19 +92,29 @@ async function startServer() {
     currentRole?: 'master' | 'client' | 'unknown',
     currentId?: string
   ) => {
-    const senderId = String(msg.senderId || msg.nodeId || currentId || '');
+    const senderId = String(
+      msg.senderId || msg.nodeId || msg.peerId || currentId || ''
+    );
 
-    // 1. Registrasi Master
-    if (msg.role === 'master' || msg.type === 'register_master') {
+    // 1. Registrasi eksplisit Master
+    if (
+      msg.role === 'master' ||
+      msg.role === 'MASTER' ||
+      msg.type === 'register_master'
+    ) {
       masterLastSeenAt = Date.now();
+      if (!masterId) {
+        masterId = senderId || 'master';
+      }
       if (sourceWs) {
+        masterSocket = sourceWs;
         masterSockets.add(sourceWs);
-        clientsMap.set('master', { ws: sourceWs, role: 'master', id: 'master' });
+        clientsMap.set('master', { ws: sourceWs, role: 'master', id: masterId });
       }
 
-      // Beritahu semua Klien yang sedang standby agar langsung mengirim Offer
       const onlineNotice: SignalingMessage = {
         type: 'master_online',
+        masterId,
         timestamp: Date.now(),
       };
       clientsMap.forEach((entry) => {
@@ -110,12 +127,20 @@ async function startServer() {
     }
 
     // 2. Registrasi Klien Pasif
-    if (msg.role === 'client' || msg.type === 'register_client') {
+    if (
+      msg.role === 'client' ||
+      msg.role === 'CLIENT' ||
+      msg.type === 'register_client'
+    ) {
       if (senderId && sourceWs) {
         clientsMap.set(senderId, { ws: sourceWs, role: 'client', id: senderId });
       }
       if (masterSockets.size > 0 || Date.now() - masterLastSeenAt < 15000) {
-        const notice: SignalingMessage = { type: 'master_online', timestamp: Date.now() };
+        const notice: SignalingMessage = {
+          type: 'master_online',
+          masterId: masterId || 'master',
+          timestamp: Date.now(),
+        };
         if (sourceWs) sendSafe(sourceWs, notice);
         if (senderId) enqueueMailbox(senderId, notice);
       }
@@ -123,13 +148,13 @@ async function startServer() {
     }
 
     // 3. Routing Pesan ke Master (`target: "master"`)
-    if (msg.target === 'master') {
+    if (msg.target === 'master' || (masterId && msg.target === masterId)) {
       const enriched: SignalingMessage = {
         ...msg,
         senderId: senderId || msg.senderId,
       };
-      masterSockets.forEach((masterWs) => {
-        sendSafe(masterWs, enriched);
+      masterSockets.forEach((mWs) => {
+        sendSafe(mWs, enriched);
       });
       enqueueMailbox('master', enriched);
       return;
@@ -162,7 +187,7 @@ async function startServer() {
   };
 
   wss.on('connection', (ws: WebSocket) => {
-    let currentId = '';
+    let currentId = String(Math.floor(1000 + Math.random() * 9000));
     let currentRole: 'master' | 'client' | 'unknown' = 'unknown';
 
     ws.on('message', (rawBuffer) => {
@@ -174,17 +199,75 @@ async function startServer() {
       }
       if (!msg || typeof msg !== 'object') return;
 
-      const senderId = String(msg.senderId || msg.nodeId || currentId || '');
-      if (senderId && !currentId) {
-        currentId = senderId;
+      const requestedId = String(
+        msg.peerId || msg.senderId || msg.nodeId || currentId
+      );
+      if (requestedId) {
+        currentId = requestedId;
       }
+
+      // ========================================================================
+      // DYNAMIC ROLE ASSIGNMENT HANDLER (`type: "REQUEST_ROLE"`)
+      // ========================================================================
+      if (msg.type === 'REQUEST_ROLE') {
+        // Bersihkan socket Master yang sudah tidak aktif
+        masterSockets.forEach((s) => {
+          if (s.readyState !== WebSocket.OPEN) {
+            masterSockets.delete(s);
+          }
+        });
+
+        const isMasterAlive = masterId !== null && masterSockets.size > 0;
+
+        if (!isMasterAlive) {
+          // a. Jika masterId masih kosong, tetapkan peer ini sebagai MASTER
+          masterId = currentId;
+          masterSocket = ws;
+          currentRole = 'master';
+          masterSockets.add(ws);
+          clientsMap.set(currentId, { ws, role: 'master', id: currentId });
+
+          sendSafe(ws, {
+            type: 'ROLE_ASSIGNED',
+            role: 'MASTER',
+            peerId: currentId,
+            masterId: currentId,
+          });
+        } else {
+          // b. Jika masterId sudah ada, tetapkan peer baru ini sebagai CLIENT
+          currentRole = 'client';
+          clientsMap.set(currentId, { ws, role: 'client', id: currentId });
+
+          sendSafe(ws, {
+            type: 'ROLE_ASSIGNED',
+            role: 'CLIENT',
+            peerId: currentId,
+            masterId,
+          });
+
+          // Teruskan info Klien baru ini ke Master
+          masterSockets.forEach((mWs) => {
+            sendSafe(mWs, {
+              type: 'NEW_CLIENT_JOINED',
+              clientId: currentId,
+              senderId: currentId,
+              timestamp: Date.now(),
+            });
+          });
+        }
+        return;
+      }
+
       if (msg.role === 'master' || msg.type === 'register_master') {
         currentRole = 'master';
-        currentId = 'master';
-      } else if (senderId && currentRole !== 'master') {
+        masterSocket = ws;
+        masterSockets.add(ws);
+        if (!masterId) {
+          masterId = currentId;
+        }
+      } else if (currentRole !== 'master') {
         currentRole = 'client';
-        currentId = senderId;
-        clientsMap.set(senderId, { ws, role: 'client', id: senderId });
+        clientsMap.set(currentId, { ws, role: 'client', id: currentId });
       }
 
       routeSignalingMessage(msg, ws, currentRole, currentId);
@@ -194,6 +277,14 @@ async function startServer() {
       if (currentRole === 'master') {
         masterSockets.delete(ws);
       }
+
+      // Jika seluruh koneksi Master terputus (disconnect), reset masterId = null
+      // agar perangkat lain yang pertama kali merefresh bisa mengambil alih posisi Master
+      if (masterSockets.size === 0 && (ws === masterSocket || currentRole === 'master')) {
+        masterId = null;
+        masterSocket = null;
+      }
+
       if (currentId) {
         const existing = clientsMap.get(currentId);
         if (existing && existing.ws === ws) {
@@ -203,21 +294,19 @@ async function startServer() {
           const disconnectMsg: SignalingMessage = {
             type: 'client_disconnected',
             senderId: currentId,
+            clientId: currentId,
           };
-          masterSockets.forEach((masterWs) => {
-            sendSafe(masterWs, disconnectMsg);
+          masterSockets.forEach((mWs) => {
+            sendSafe(mWs, disconnectMsg);
           });
           enqueueMailbox('master', disconnectMsg);
         }
       }
     });
 
-    ws.on('error', () => {
-      // Abaikan error socket prematur agar server tetap stabil
-    });
+    ws.on('error', () => {});
   });
 
-  // HTTP Signaling Fallback Endpoints (agar 100% bebas error jika proxy menutup WebSocket)
   app.post('/api/signal', (req, res) => {
     const msg = req.body as SignalingMessage;
     if (!msg || typeof msg !== 'object') {
@@ -230,7 +319,11 @@ async function startServer() {
       masterLastSeenAt = Date.now();
     }
     routeSignalingMessage(msg, undefined, role, id);
-    res.json({ ok: true, masterOnline: masterSockets.size > 0 || Date.now() - masterLastSeenAt < 15000 });
+    res.json({
+      ok: true,
+      masterId,
+      masterOnline: masterSockets.size > 0 || Date.now() - masterLastSeenAt < 15000,
+    });
   });
 
   app.get('/api/signal/:targetId', (req, res) => {
@@ -243,6 +336,7 @@ async function startServer() {
     res.json({
       ok: true,
       messages,
+      masterId,
       masterOnline: masterSockets.size > 0 || Date.now() - masterLastSeenAt < 15000,
     });
   });
@@ -250,6 +344,7 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
+      masterId,
       mastersOnline: masterSockets.size,
       clientsOnline: Array.from(clientsMap.values()).filter((c) => c.role === 'client').length,
     });
@@ -273,7 +368,7 @@ async function startServer() {
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`S.I.G.M.A. Signaling & Telemetry Server listening on http://0.0.0.0:${PORT}`);
+    console.log(`S.I.G.M.A. Universal Dynamic Role Server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
