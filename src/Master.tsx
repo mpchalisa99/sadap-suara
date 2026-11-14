@@ -82,6 +82,20 @@ interface MasterProps {
 
 const INDONESIA_DEFAULT_CENTER: [number, number] = [-2.5489, 118.0149];
 const GAIN_STEPS = [0, 6, 12, 18, 24];
+const MAX_CLIENTS = 5;
+
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+  ],
+};
+
+function getSignalingWebSocketUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws`;
+}
 
 function formatFileTimestamp(d: Date): string {
   const yyyy = d.getFullYear();
@@ -208,6 +222,12 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const pipelinesRef = useRef<Map<string, AudioPipelineEntry>>(new Map());
+  // Dictionary utama `const peerConnections = {}` untuk menampung hingga 5 RTCPeerConnection Klien
+  const peerConnectionsRef = useRef<Record<string, RTCPeerConnection>>({});
+  const nativeDataChannelsRef = useRef<Record<string, RTCDataChannel>>({});
+  const pendingCandidatesRef = useRef<Record<string, RTCIceCandidateInit[]>>({});
+  const wsRef = useRef<WebSocket | null>(null);
+
   const dataConnsRef = useRef<Map<string, DataConnection>>(new Map());
   const mediaCallsRef = useRef<Map<string, MediaConnection>>(new Map());
   const negotiationHandlersRef = useRef<
@@ -539,7 +559,23 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   const removeDisconnectedClient = useCallback((nodeId: string) => {
     const hasOpenData = dataConnsRef.current.get(nodeId)?.open;
     const hasOpenMedia = mediaCallsRef.current.get(nodeId)?.open;
-    if (hasOpenData || hasOpenMedia) return;
+    const nativePc = peerConnectionsRef.current[nodeId];
+    const hasOpenNativePc =
+      nativePc &&
+      (nativePc.connectionState === 'connected' ||
+        nativePc.iceConnectionState === 'connected' ||
+        nativePc.iceConnectionState === 'completed');
+
+    if (hasOpenData || hasOpenMedia || hasOpenNativePc) return;
+
+    if (peerConnectionsRef.current[nodeId]) {
+      try {
+        peerConnectionsRef.current[nodeId].close();
+      } catch {}
+      delete peerConnectionsRef.current[nodeId];
+    }
+    delete nativeDataChannelsRef.current[nodeId];
+    delete pendingCandidatesRef.current[nodeId];
 
     const audioEl = nodeAudioElsRef.current.get(nodeId);
     if (audioEl) {
@@ -894,6 +930,18 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   const disconnectNode = useCallback(
     (nodeId: string) => {
       stopNodeRecording(nodeId);
+      if (peerConnectionsRef.current[nodeId]) {
+        try {
+          peerConnectionsRef.current[nodeId].close();
+        } catch {}
+        delete peerConnectionsRef.current[nodeId];
+      }
+      if (nativeDataChannelsRef.current[nodeId]) {
+        try {
+          nativeDataChannelsRef.current[nodeId].close();
+        } catch {}
+        delete nativeDataChannelsRef.current[nodeId];
+      }
       const conn = dataConnsRef.current.get(nodeId);
       if (conn) {
         conn.close();
@@ -909,15 +957,285 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     [removeDisconnectedClient, stopNodeRecording]
   );
 
-  // Initialize Master PeerJS Broker
+  /**
+   * ============================================================================
+   * PENERIMAAN OTOMATIS BERURUTAN DI SISI MASTER (WEBSOCKET + NATIVE WEBRTC)
+   * ============================================================================
+   * 1. Saat Master dimuat, langsung terhubung ke WebSocket dengan `role: "master"`.
+   * 2. Saat menerima `type: "offer"` dari `senderId`, Master otomatis:
+   *    a. Membuat instans `RTCPeerConnection` baru untuk `senderId`.
+   *    b. Menyimpan ke dalam `const peerConnections = peerConnectionsRef.current`.
+   *    c. Menyimpan `RemoteDescription` dan otomatis mengirim balik `Answer`.
+   *    d. Saat `ontrack` dari Klien 1..5 masuk, otomatis merender elemen `<audio autoplay>`
+   *       baru ke dalam DOM agar suara antar Klien tidak saling menimpa.
+   */
   useEffect(() => {
-    const masterId = `sigma-master-${Math.floor(1000 + Math.random() * 9000)}`;
-    const peer = new Peer(masterId, { debug: 0 });
+    let isMounted = true;
+    let reconnectTimer: number | null = null;
+    const peerConnections = peerConnectionsRef.current;
+
+    const connectMasterWebSocket = () => {
+      if (!isMounted) return;
+      if (
+        wsRef.current &&
+        (wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      try {
+        const ws = new WebSocket(getSignalingWebSocketUrl());
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (!isMounted) return;
+          ws.send(
+            JSON.stringify({
+              type: 'register_master',
+              role: 'master',
+              senderId: 'master',
+            })
+          );
+          setConnectionBanner(
+            'MASTER ONLINE (ROLE: MASTER) · AUTO-DISCOVERY SIAP MENERIMA HINGGA 5 KLIEN'
+          );
+        };
+
+        ws.onmessage = async (event) => {
+          if (!isMounted) return;
+          let msg: Record<string, unknown> | null = null;
+          try {
+            msg = JSON.parse(event.data) as Record<string, unknown>;
+          } catch {
+            return;
+          }
+          if (!msg || typeof msg.type !== 'string') return;
+
+          const senderId = String(msg.senderId || msg.nodeId || '').replace(
+            'sigma-node-',
+            ''
+          );
+
+          // A. Tangani Paket Telemetri GPS langsung via WebSocket apabila dikirim sebagai cadangan
+          if (msg.type === 'SIGMA_TELEMETRY' && senderId) {
+            handleIncomingTelemetry(msg as unknown as TelemetryPayload);
+            return;
+          }
+
+          // B. Tangani Notifikasi Putusnya Klien
+          if (msg.type === 'client_disconnected' && senderId) {
+            if (peerConnections[senderId]) {
+              try {
+                peerConnections[senderId].close();
+              } catch {}
+              delete peerConnections[senderId];
+            }
+            removeDisconnectedClient(senderId);
+            return;
+          }
+
+          // C. PENERIMAAN OTOMATIS BERURUTAN SAAT MENERIMA `type: "offer"` DARI `senderId`
+          if (msg.type === 'offer' && senderId && msg.sdp) {
+            const isExistingClient =
+              Boolean(peerConnections[senderId]) ||
+              clientsRef.current.some((c) => c.nodeId === senderId);
+
+            // Master tidak menolak koneksi kecuali sudah lewat batas 5 klien
+            if (!isExistingClient && clientsRef.current.length >= MAX_CLIENTS) {
+              return;
+            }
+
+            // Tutup koneksi lama milik senderId yang sama jika ia sedang melakukan Auto-Reconnect
+            if (peerConnections[senderId]) {
+              try {
+                peerConnections[senderId].onicecandidate = null;
+                peerConnections[senderId].ontrack = null;
+                peerConnections[senderId].onconnectionstatechange = null;
+                peerConnections[senderId].close();
+              } catch {}
+            }
+
+            // a. Buat instans RTCPeerConnection baru untuk senderId tersebut
+            const pc = new RTCPeerConnection(RTC_CONFIG);
+
+            // b. Masukkan instans ke dalam `peerConnections[senderId]`
+            peerConnections[senderId] = pc;
+            pendingCandidatesRef.current[senderId] = [];
+
+            upsertConnectedClient(senderId, {
+              lastTelemetryAt: Date.now(),
+            });
+            setConnectionBanner(
+              `AUTO-HANDSHAKE: MENERIMA OFFER DARI KLIEN (${senderId})...`
+            );
+
+            // Kirim ICE Candidate Master kembali ke Klien `senderId`
+            pc.onicecandidate = (iceEvent) => {
+              if (iceEvent.candidate && ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'candidate',
+                    role: 'master',
+                    senderId: 'master',
+                    target: senderId,
+                    candidate: iceEvent.candidate.toJSON(),
+                  })
+                );
+              }
+            };
+
+            // 3. PENANGANAN STATE & UI MASTER SAAT `ontrack` MASUK DARI KLIEN 1..5
+            pc.ontrack = (trackEvent: RTCTrackEvent) => {
+              // Render elemen <audio autoplay playsinline> unik per senderId ke dalam DOM
+              handleIncomingAudio(trackEvent, {
+                audioId: senderId,
+                onStreamAttached: (inboundStream) => {
+                  attachWebRTCStreamToNode(senderId, inboundStream);
+                  setConnectionBanner(
+                    `AUTO-CONNECTED & AUDIO LIVE: KLIEN (${senderId})`
+                  );
+                },
+                onAutoplaySuccess: () => setAutoplayBlocked(false),
+                onAutoplayBlocked: () => setAutoplayBlocked(true),
+              });
+            };
+
+            // Tangkap RTCDataChannel dari Klien untuk telemetri GPS & remote control
+            pc.ondatachannel = (dcEvent) => {
+              const dc = dcEvent.channel;
+              nativeDataChannelsRef.current[senderId] = dc;
+              dc.onmessage = (msgEv) => {
+                try {
+                  const parsed = JSON.parse(msgEv.data) as TelemetryPayload;
+                  handleIncomingTelemetry(parsed);
+                } catch {}
+              };
+            };
+
+            pc.onconnectionstatechange = () => {
+              const st = pc.connectionState;
+              if (st === 'connected') {
+                setConnectionBanner(
+                  `RTCPeerConnection ACTIVE: KLIEN (${senderId})`
+                );
+              } else if (st === 'failed' || st === 'closed' || st === 'disconnected') {
+                if (peerConnections[senderId] === pc) {
+                  delete peerConnections[senderId];
+                  delete nativeDataChannelsRef.current[senderId];
+                  removeDisconnectedClient(senderId);
+                }
+              }
+            };
+
+            try {
+              // c. Simpan RemoteDescription dan otomatis kirim balik Answer
+              await pc.setRemoteDescription(
+                new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit)
+              );
+
+              // Tambahkan ICE candidate yang sempat masuk sebelum RemoteDescription siap
+              const queued = pendingCandidatesRef.current[senderId] || [];
+              while (queued.length > 0) {
+                const cand = queued.shift();
+                if (cand) {
+                  await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                }
+              }
+
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+
+              if (ws.readyState === WebSocket.OPEN && pc.localDescription) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'answer',
+                    role: 'master',
+                    senderId: 'master',
+                    target: senderId,
+                    sdp: {
+                      type: pc.localDescription.type,
+                      sdp: pc.localDescription.sdp,
+                    },
+                  })
+                );
+              }
+            } catch {}
+            return;
+          }
+
+          // D. Tangani ICE Candidate dari Klien `senderId`
+          if (msg.type === 'candidate' && senderId && msg.candidate) {
+            const pc = peerConnections[senderId];
+            if (!pc) return;
+            const candidateInit = msg.candidate as RTCIceCandidateInit;
+            if (pc.remoteDescription && pc.remoteDescription.type) {
+              await pc.addIceCandidate(new RTCIceCandidate(candidateInit)).catch(() => {});
+            } else {
+              if (!pendingCandidatesRef.current[senderId]) {
+                pendingCandidatesRef.current[senderId] = [];
+              }
+              pendingCandidatesRef.current[senderId].push(candidateInit);
+            }
+          }
+        };
+
+        ws.onclose = () => {
+          if (!isMounted) return;
+          reconnectTimer = window.setTimeout(connectMasterWebSocket, 2500);
+        };
+
+        ws.onerror = () => {
+          try {
+            ws.close();
+          } catch {}
+        };
+      } catch {
+        reconnectTimer = window.setTimeout(connectMasterWebSocket, 3000);
+      }
+    };
+
+    connectMasterWebSocket();
+
+    return () => {
+      isMounted = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {}
+      }
+      Object.keys(peerConnections).forEach((id) => {
+        try {
+          peerConnections[id].close();
+        } catch {}
+        delete peerConnections[id];
+      });
+    };
+  }, [
+    attachWebRTCStreamToNode,
+    handleIncomingTelemetry,
+    removeDisconnectedClient,
+    upsertConnectedClient,
+  ]);
+
+  // Initialize Master PeerJS Broker (Fallback layer dengan ID tetap `sigma-master-main`)
+  useEffect(() => {
+    const primaryMasterId = 'sigma-master-main';
+    const peer = new Peer(primaryMasterId, { debug: 0 });
     peerRef.current = peer;
 
     peer.on('open', (id) => {
       setMasterPeerId(id);
-      setConnectionBanner(`MASTER READY (${id}) · MENUNGGU KONEKSI CLIENT`);
+    });
+
+    peer.on('error', (err: { type?: string }) => {
+      if (err?.type === 'unavailable-id') {
+        const backupId = `sigma-master-${Math.floor(1000 + Math.random() * 9000)}`;
+        const backupPeer = new Peer(backupId, { debug: 0 });
+        peerRef.current = backupPeer;
+        backupPeer.on('open', (id) => setMasterPeerId(id));
+      }
     });
 
     peer.on('call', (incomingCall) => {
@@ -926,10 +1244,11 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         incomingCall.peer.replace('sigma-node-', '');
 
       if (/^\d{4}$/.test(metaNodeId)) {
-        // Pasang listener ontrack & on('stream') SEBELUM memanggil answer()
+        const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
+        if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
+
         registerMediaConnection(metaNodeId, incomingCall);
         incomingCall.answer();
-        // Pastikan ontrack juga terikat pada peerConnection yang baru dibuat saat answer()
         if (incomingCall.peerConnection) {
           incomingCall.peerConnection.ontrack = (event: RTCTrackEvent) => {
             handleIncomingAudio(event, {
@@ -952,6 +1271,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       const metaNodeId =
         conn.metadata?.nodeId || conn.peer.replace('sigma-node-', '');
       if (/^\d{4}$/.test(metaNodeId)) {
+        const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
+        if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
         registerDataConnection(metaNodeId, conn);
       }
     });
@@ -1165,6 +1486,43 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     }
   };
 
+  const dispatchRemoteNodeCommand = useCallback(
+    (
+      nodeId: string,
+      commandType: 'SET_GAIN' | 'SET_MUTE' | 'EMERGENCY_WIPE',
+      value?: number | boolean
+    ) => {
+      // 1. Kirim via Native RTCDataChannel
+      const nativeDc = nativeDataChannelsRef.current[nodeId];
+      if (nativeDc) {
+        sendCommand(nativeDc, commandType, value);
+      }
+
+      // 2. Kirim via PeerJS DataConnection
+      const peerConn = dataConnsRef.current.get(nodeId);
+      if (peerConn) {
+        sendCommand(peerConn, commandType, value);
+      }
+
+      // 3. Kirim via WebSocket Signaling Server
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(
+            JSON.stringify({
+              type: commandType,
+              role: 'master',
+              senderId: 'master',
+              target: nodeId,
+              value,
+              timestamp: Date.now(),
+            })
+          );
+        } catch {}
+      }
+    },
+    []
+  );
+
   const handleCycleGain = (nodeId: string) => {
     unlockAllAudioPlayback();
     setClients((prev) =>
@@ -1173,8 +1531,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         const nextIdx = (GAIN_STEPS.indexOf(c.gainDb) + 1) % GAIN_STEPS.length;
         const nextGainDb = GAIN_STEPS[nextIdx];
         const remoteLinearGain = Number(Math.pow(10, nextGainDb / 20).toFixed(2));
-        const conn = dataConnsRef.current.get(nodeId);
-        sendCommand(conn, 'SET_GAIN', remoteLinearGain);
+        dispatchRemoteNodeCommand(nodeId, 'SET_GAIN', remoteLinearGain);
         setConnectionBanner(
           `REMOTE GAIN COMMAND SENT TO NODE (${nodeId}): +${nextGainDb}dB (${remoteLinearGain}x)`
         );
@@ -1189,8 +1546,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       prev.map((c) => {
         if (c.nodeId !== nodeId) return c;
         const nextMuted = !c.remoteMuted;
-        const conn = dataConnsRef.current.get(nodeId);
-        sendCommand(conn, 'SET_MUTE', nextMuted);
+        dispatchRemoteNodeCommand(nodeId, 'SET_MUTE', nextMuted);
         setConnectionBanner(
           `REMOTE MIC ${nextMuted ? 'MUTED' : 'UNMUTED'} ON PASSIVE CLIENT (${nodeId})`
         );
@@ -1200,8 +1556,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   };
 
   const handleEmergencyWipeNode = (nodeId: string) => {
-    const conn = dataConnsRef.current.get(nodeId);
-    triggerEmergencyWipe(conn);
+    dispatchRemoteNodeCommand(nodeId, 'EMERGENCY_WIPE', true);
+    triggerEmergencyWipe(dataConnsRef.current.get(nodeId));
     setConnectionBanner(`EMERGENCY_WIPE TRIGGERED FOR PASSIVE CLIENT (${nodeId})`);
     setTimeout(() => {
       disconnectNode(nodeId);
@@ -1210,8 +1566,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
   const handleEmergencyWipeAll = () => {
     connectedClients.forEach((c) => {
-      const conn = dataConnsRef.current.get(c.nodeId);
-      triggerEmergencyWipe(conn);
+      dispatchRemoteNodeCommand(c.nodeId, 'EMERGENCY_WIPE', true);
+      triggerEmergencyWipe(dataConnsRef.current.get(c.nodeId));
       setTimeout(() => {
         disconnectNode(c.nodeId);
       }, 180);

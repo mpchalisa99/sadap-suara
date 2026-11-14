@@ -14,7 +14,8 @@ export interface RemoteCommandPacket {
 }
 
 export interface DataChannelLike {
-  send: (data: string | RemoteCommandPacket) => void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  send: (data: any) => void;
   readyState?: RTCDataChannelState;
   open?: boolean;
   onmessage?: ((event: MessageEvent) => void) | null;
