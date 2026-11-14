@@ -8,23 +8,19 @@ import { createServer as createViteServer } from 'vite';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-interface SignalingMessage {
+interface SignalingPacket {
   type: string;
-  role?: 'master' | 'client' | 'MASTER' | 'CLIENT';
   senderId?: string;
-  nodeId?: string;
-  peerId?: string;
-  clientId?: string;
+  targetId?: string;
   target?: string;
+  role?: string;
+  peerId?: string;
+  nodeId?: string;
+  clientId?: string;
+  data?: unknown;
   sdp?: unknown;
   candidate?: unknown;
   [key: string]: unknown;
-}
-
-interface TrackedSocket {
-  ws: WebSocket;
-  role: 'master' | 'client' | 'unknown';
-  id: string;
 }
 
 async function startServer() {
@@ -35,26 +31,32 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   // ============================================================================
-  // 1. LOGIKA SIGNALING SERVER (NODE.JS / WEBSOCKET) — DYNAMIC ROLE ASSIGNMENT
+  // 1. WEBSOCKET ROUTING YANG KETAT (NODE.JS SERVER)
   // ============================================================================
-  const wss = new WebSocketServer({ noServer: true });
-  const clientsMap = new Map<string, TrackedSocket>();
-  const masterSockets = new Set<WebSocket>();
+  // Menyimpan daftar koneksi aktif di dalam Map<ID, WebSocket>
+  // - Master terdaftar dengan key "MASTER"
+  // - Setiap Klien terdaftar dengan ID uniknya masing-masing (misal: "client-x9a2b")
+  const connections = new Map<string, WebSocket>();
+  const socketToId = new Map<WebSocket, string>();
 
-  // Variabel pelacak status Master tunggal
-  let masterId: string | null = null;
-  let masterSocket: WebSocket | null = null;
+  // Antrean pesan HTTP fallback (opsional untuk diagnostik)
+  const httpMailboxes = new Map<string, SignalingPacket[]>();
 
-  // In-memory HTTP signaling message queue fallback
-  const httpMailboxes = new Map<string, SignalingMessage[]>();
-  let masterLastSeenAt = 0;
-
-  const enqueueMailbox = (targetId: string, msg: SignalingMessage) => {
-    const queue = httpMailboxes.get(targetId) || [];
-    queue.push(msg);
-    if (queue.length > 50) queue.shift();
-    httpMailboxes.set(targetId, queue);
+  const sendSafe = (targetWs: WebSocket | undefined, payload: unknown) => {
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+      try {
+        targetWs.send(JSON.stringify(payload));
+      } catch {}
+    }
   };
+
+  const normalizeTargetId = (rawTarget?: string): string => {
+    if (!rawTarget) return '';
+    if (rawTarget.toUpperCase() === 'MASTER') return 'MASTER';
+    return String(rawTarget);
+  };
+
+  const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (request, socket, head) => {
     const protocolHeader = request.headers['sec-websocket-protocol'] || '';
@@ -69,7 +71,11 @@ async function startServer() {
       return;
     }
 
-    if (reqUrl.startsWith('/ws') || reqUrl.startsWith('/signaling') || reqUrl === '/') {
+    if (
+      reqUrl.startsWith('/ws') ||
+      reqUrl.startsWith('/signaling') ||
+      reqUrl === '/'
+    ) {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
@@ -78,228 +84,166 @@ async function startServer() {
     }
   });
 
-  const sendSafe = (targetWs: WebSocket | null | undefined, payload: unknown) => {
-    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-      try {
-        targetWs.send(JSON.stringify(payload));
-      } catch {}
-    }
-  };
-
-  const routeSignalingMessage = (
-    msg: SignalingMessage,
-    sourceWs?: WebSocket,
-    currentRole?: 'master' | 'client' | 'unknown',
-    currentId?: string
-  ) => {
-    const senderId = String(
-      msg.senderId || msg.nodeId || msg.peerId || currentId || ''
-    );
-
-    // 1. Registrasi eksplisit Master
-    if (
-      msg.role === 'master' ||
-      msg.role === 'MASTER' ||
-      msg.type === 'register_master'
-    ) {
-      masterLastSeenAt = Date.now();
-      if (!masterId) {
-        masterId = senderId || 'master';
-      }
-      if (sourceWs) {
-        masterSocket = sourceWs;
-        masterSockets.add(sourceWs);
-        clientsMap.set('master', { ws: sourceWs, role: 'master', id: masterId });
-      }
-
-      const onlineNotice: SignalingMessage = {
-        type: 'master_online',
-        masterId,
-        timestamp: Date.now(),
-      };
-      clientsMap.forEach((entry) => {
-        if (entry.role === 'client') {
-          sendSafe(entry.ws, onlineNotice);
-          enqueueMailbox(entry.id, onlineNotice);
-        }
-      });
-      return;
-    }
-
-    // 2. Registrasi Klien Pasif
-    if (
-      msg.role === 'client' ||
-      msg.role === 'CLIENT' ||
-      msg.type === 'register_client'
-    ) {
-      if (senderId && sourceWs) {
-        clientsMap.set(senderId, { ws: sourceWs, role: 'client', id: senderId });
-      }
-      if (masterSockets.size > 0 || Date.now() - masterLastSeenAt < 15000) {
-        const notice: SignalingMessage = {
-          type: 'master_online',
-          masterId: masterId || 'master',
-          timestamp: Date.now(),
-        };
-        if (sourceWs) sendSafe(sourceWs, notice);
-        if (senderId) enqueueMailbox(senderId, notice);
-      }
-      return;
-    }
-
-    // 3. Routing Pesan ke Master (`target: "master"`)
-    if (msg.target === 'master' || (masterId && msg.target === masterId)) {
-      const enriched: SignalingMessage = {
-        ...msg,
-        senderId: senderId || msg.senderId,
-      };
-      masterSockets.forEach((mWs) => {
-        sendSafe(mWs, enriched);
-      });
-      enqueueMailbox('master', enriched);
-      return;
-    }
-
-    // 4. Routing Pesan dari Master ke Klien tertentu (`target: "<senderId>"`)
-    if (msg.target && msg.target !== 'master') {
-      const targetKey = String(msg.target);
-      const enriched: SignalingMessage = {
-        ...msg,
-        senderId: senderId || 'master',
-      };
-      const targetClient = clientsMap.get(targetKey);
-      if (targetClient) {
-        sendSafe(targetClient.ws, enriched);
-      }
-      enqueueMailbox(targetKey, enriched);
-      return;
-    }
-
-    // 5. Broadcast dari Master ke semua Klien
-    if (currentRole === 'master' && !msg.target) {
-      clientsMap.forEach((entry) => {
-        if (entry.role === 'client') {
-          sendSafe(entry.ws, msg);
-          enqueueMailbox(entry.id, msg);
-        }
-      });
-    }
-  };
-
   wss.on('connection', (ws: WebSocket) => {
-    let currentId = String(Math.floor(1000 + Math.random() * 9000));
-    let currentRole: 'master' | 'client' | 'unknown' = 'unknown';
-
     ws.on('message', (rawBuffer) => {
-      let msg: SignalingMessage | null = null;
+      let msg: SignalingPacket | null = null;
       try {
-        msg = JSON.parse(rawBuffer.toString()) as SignalingMessage;
+        msg = JSON.parse(rawBuffer.toString()) as SignalingPacket;
       } catch {
         return;
       }
-      if (!msg || typeof msg !== 'object') return;
-
-      const requestedId = String(
-        msg.peerId || msg.senderId || msg.nodeId || currentId
-      );
-      if (requestedId) {
-        currentId = requestedId;
+      if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') {
+        return;
       }
 
-      // ========================================================================
-      // DYNAMIC ROLE ASSIGNMENT HANDLER (`type: "REQUEST_ROLE"`)
-      // ========================================================================
-      if (msg.type === 'REQUEST_ROLE') {
-        // Bersihkan socket Master yang sudah tidak aktif
-        masterSockets.forEach((s) => {
-          if (s.readyState !== WebSocket.OPEN) {
-            masterSockets.delete(s);
-          }
-        });
+      const rawSenderId = String(
+        msg.senderId || msg.peerId || msg.nodeId || socketToId.get(ws) || ''
+      );
+      const isMasterRegistration =
+        msg.senderId === 'MASTER' ||
+        msg.senderId === 'master' ||
+        msg.role === 'MASTER' ||
+        msg.role === 'master' ||
+        msg.type === 'register_master' ||
+        (msg.type === 'REGISTER' &&
+          (String(msg.senderId).toUpperCase() === 'MASTER' ||
+            String(msg.role).toUpperCase() === 'MASTER'));
 
-        const isMasterAlive = masterId !== null && masterSockets.size > 0;
+      // ======================================================================
+      // A. DYNAMIC ROLE ASSIGNMENT (`REQUEST_ROLE`)
+      // ======================================================================
+      if (msg.type === 'REQUEST_ROLE') {
+        const currentMasterWs = connections.get('MASTER');
+        const isMasterAlive =
+          currentMasterWs !== undefined &&
+          currentMasterWs.readyState === WebSocket.OPEN;
 
         if (!isMasterAlive) {
-          // a. Jika masterId masih kosong, tetapkan peer ini sebagai MASTER
-          masterId = currentId;
-          masterSocket = ws;
-          currentRole = 'master';
-          masterSockets.add(ws);
-          clientsMap.set(currentId, { ws, role: 'master', id: currentId });
-
+          connections.set('MASTER', ws);
+          socketToId.set(ws, 'MASTER');
           sendSafe(ws, {
             type: 'ROLE_ASSIGNED',
             role: 'MASTER',
-            peerId: currentId,
-            masterId: currentId,
+            peerId: 'MASTER',
+            masterId: 'MASTER',
           });
         } else {
-          // b. Jika masterId sudah ada, tetapkan peer baru ini sebagai CLIENT
-          currentRole = 'client';
-          clientsMap.set(currentId, { ws, role: 'client', id: currentId });
+          const assignedClientId =
+            rawSenderId && rawSenderId.toUpperCase() !== 'MASTER'
+              ? rawSenderId
+              : `client-${Math.random().toString(36).substring(2, 8)}`;
+          connections.set(assignedClientId, ws);
+          socketToId.set(ws, assignedClientId);
 
           sendSafe(ws, {
             type: 'ROLE_ASSIGNED',
             role: 'CLIENT',
-            peerId: currentId,
-            masterId,
-          });
-
-          // Teruskan info Klien baru ini ke Master
-          masterSockets.forEach((mWs) => {
-            sendSafe(mWs, {
-              type: 'NEW_CLIENT_JOINED',
-              clientId: currentId,
-              senderId: currentId,
-              timestamp: Date.now(),
-            });
+            peerId: assignedClientId,
+            masterId: 'MASTER',
           });
         }
         return;
       }
 
-      if (msg.role === 'master' || msg.type === 'register_master') {
-        currentRole = 'master';
-        masterSocket = ws;
-        masterSockets.add(ws);
-        if (!masterId) {
-          masterId = currentId;
+      // ======================================================================
+      // B. REGISTRASI IDENTITAS KE `Map<ID, ws>`
+      // ======================================================================
+      if (isMasterRegistration) {
+        connections.set('MASTER', ws);
+        socketToId.set(ws, 'MASTER');
+
+        // Jika ini pesan registrasi murni (tanpa targetId spesifik), beri tahu Klien bahwa MASTER aktif
+        if (
+          msg.type === 'REGISTER' ||
+          msg.type === 'register_master'
+        ) {
+          connections.forEach((clientWs, id) => {
+            if (id !== 'MASTER' && clientWs.readyState === WebSocket.OPEN) {
+              sendSafe(clientWs, {
+                type: 'master_online',
+                senderId: 'MASTER',
+                targetId: id,
+              });
+            }
+          });
+          return;
         }
-      } else if (currentRole !== 'master') {
-        currentRole = 'client';
-        clientsMap.set(currentId, { ws, role: 'client', id: currentId });
+      } else if (rawSenderId) {
+        // Simpan koneksi Klien dengan ID uniknya di Map<ID, ws>
+        connections.set(rawSenderId, ws);
+        socketToId.set(ws, rawSenderId);
+
+        if (msg.type === 'REGISTER' || msg.type === 'register_client') {
+          const masterWs = connections.get('MASTER');
+          if (masterWs && masterWs.readyState === WebSocket.OPEN) {
+            sendSafe(ws, {
+              type: 'master_online',
+              senderId: 'MASTER',
+              targetId: rawSenderId,
+            });
+          }
+          return;
+        }
       }
 
-      routeSignalingMessage(msg, ws, currentRole, currentId);
+      // ======================================================================
+      // C. TARGETED ROUTING KETAT (TIDAK BOLEH BROADCAST!)
+      // Hanya kirim pesan spesifik ke `connections.get(targetId)`
+      // ======================================================================
+      const targetId = normalizeTargetId(
+        String(msg.targetId || msg.target || '')
+      );
+      if (!targetId) return;
+
+      const senderId = isMasterRegistration ? 'MASTER' : rawSenderId;
+      const targetWs = connections.get(targetId);
+
+      const routedPacket: SignalingPacket = {
+        ...msg,
+        senderId,
+        targetId,
+        target: targetId,
+        data:
+          msg.data !== undefined
+            ? msg.data
+            : msg.sdp !== undefined
+            ? msg.sdp
+            : msg.candidate !== undefined
+            ? msg.candidate
+            : undefined,
+      };
+
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        sendSafe(targetWs, routedPacket);
+      }
+
+      // Simpan juga di mailbox HTTP jika diperlukan oleh diagnostik
+      const queue = httpMailboxes.get(targetId) || [];
+      queue.push(routedPacket);
+      if (queue.length > 50) queue.shift();
+      httpMailboxes.set(targetId, queue);
     });
 
     ws.on('close', () => {
-      if (currentRole === 'master') {
-        masterSockets.delete(ws);
-      }
+      const closedId = socketToId.get(ws);
+      socketToId.delete(ws);
 
-      // Jika seluruh koneksi Master terputus (disconnect), reset masterId = null
-      // agar perangkat lain yang pertama kali merefresh bisa mengambil alih posisi Master
-      if (masterSockets.size === 0 && (ws === masterSocket || currentRole === 'master')) {
-        masterId = null;
-        masterSocket = null;
-      }
+      if (!closedId) return;
 
-      if (currentId) {
-        const existing = clientsMap.get(currentId);
-        if (existing && existing.ws === ws) {
-          clientsMap.delete(currentId);
-        }
-        if (currentRole === 'client') {
-          const disconnectMsg: SignalingMessage = {
+      // Hapus dari Map HANYA jika socket di Map memang socket yang baru saja tertutup
+      // (mencegah penghapusan koneksi baru jika ID yang sama baru saja reconnect)
+      if (connections.get(closedId) === ws) {
+        connections.delete(closedId);
+
+        // Jika yang terputus adalah Klien, kirim notifikasi terarah HANYA ke MASTER
+        if (closedId !== 'MASTER') {
+          const masterWs = connections.get('MASTER');
+          sendSafe(masterWs, {
             type: 'client_disconnected',
-            senderId: currentId,
-            clientId: currentId,
-          };
-          masterSockets.forEach((mWs) => {
-            sendSafe(mWs, disconnectMsg);
+            senderId: closedId,
+            clientId: closedId,
+            targetId: 'MASTER',
           });
-          enqueueMailbox('master', disconnectMsg);
         }
       }
     });
@@ -307,46 +251,13 @@ async function startServer() {
     ws.on('error', () => {});
   });
 
-  app.post('/api/signal', (req, res) => {
-    const msg = req.body as SignalingMessage;
-    if (!msg || typeof msg !== 'object') {
-      res.status(400).json({ ok: false });
-      return;
-    }
-    const role = msg.role === 'master' || msg.type === 'register_master' ? 'master' : 'client';
-    const id = String(msg.senderId || msg.nodeId || (role === 'master' ? 'master' : ''));
-    if (role === 'master') {
-      masterLastSeenAt = Date.now();
-    }
-    routeSignalingMessage(msg, undefined, role, id);
-    res.json({
-      ok: true,
-      masterId,
-      masterOnline: masterSockets.size > 0 || Date.now() - masterLastSeenAt < 15000,
-    });
-  });
-
-  app.get('/api/signal/:targetId', (req, res) => {
-    const targetId = req.params.targetId;
-    if (targetId === 'master') {
-      masterLastSeenAt = Date.now();
-    }
-    const messages = httpMailboxes.get(targetId) || [];
-    httpMailboxes.set(targetId, []);
-    res.json({
-      ok: true,
-      messages,
-      masterId,
-      masterOnline: masterSockets.size > 0 || Date.now() - masterLastSeenAt < 15000,
-    });
-  });
-
   app.get('/api/health', (_req, res) => {
+    const activeIds = Array.from(connections.keys());
     res.json({
       status: 'ok',
-      masterId,
-      mastersOnline: masterSockets.size,
-      clientsOnline: Array.from(clientsMap.values()).filter((c) => c.role === 'client').length,
+      masterOnline: connections.has('MASTER'),
+      connectedIds: activeIds,
+      clientsCount: activeIds.filter((id) => id !== 'MASTER').length,
     });
   });
 
@@ -368,7 +279,9 @@ async function startServer() {
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`S.I.G.M.A. Universal Dynamic Role Server listening on http://0.0.0.0:${PORT}`);
+    console.log(
+      `S.I.G.M.A. Targeted Multi-Peer WebSocket Server listening on http://0.0.0.0:${PORT}`
+    );
   });
 }
 

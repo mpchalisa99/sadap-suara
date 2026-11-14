@@ -52,10 +52,7 @@ export function initUniversalRoleAssignment(options: UniversalRoleOptions): {
   const wsUrl = options.wsUrl || `${protocol}//${window.location.host}/ws`;
   const peerId =
     options.peerId ||
-    sessionStorage.getItem('sigma_node_4digit_id') ||
-    String(Math.floor(1000 + Math.random() * 9000));
-
-  sessionStorage.setItem('sigma_node_4digit_id', peerId);
+    `client-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
 
   let ws: WebSocket | null = null;
   let isDisposed = false;

@@ -41,6 +41,10 @@ export interface TelemetryPayload {
 
 interface SignalingMessage {
   type:
+    | 'REGISTER'
+    | 'OFFER'
+    | 'ANSWER'
+    | 'ICE_CANDIDATE'
     | 'offer'
     | 'answer'
     | 'candidate'
@@ -52,9 +56,11 @@ interface SignalingMessage {
     | 'SIGMA_SDP_RENEGOTIATE_OFFER'
     | 'SIGMA_SDP_RENEGOTIATE_ANSWER'
     | 'SIGMA_ICE_CANDIDATE';
-  role?: 'master' | 'client';
+  role?: 'master' | 'client' | 'MASTER' | 'CLIENT';
   senderId?: string;
+  targetId?: string;
   target?: string;
+  data?: unknown;
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
   masterPeerId?: string;
@@ -85,25 +91,14 @@ function getSignalingWebSocketUrl(): string {
 }
 
 export const Client: React.FC<ClientProps> = ({
-  initialNodeId,
   initialMasterPeerId,
 }) => {
+  // 3. IDENTITAS UNIK DI CLIENT (REACT):
+  // Saat komponen Client di-mount, generate ID acak yang unik untuk setiap perangkat/tab
+  // agar Klien ke-2 hingga ke-5 tidak pernah memakai ID yang sama dengan Klien ke-1.
   const [nodeId] = useState<string>(() => {
-    if (initialNodeId && /^\d{4}$/.test(initialNodeId)) {
-      sessionStorage.setItem('sigma_node_4digit_id', initialNodeId);
-      return initialNodeId;
-    }
-    const params = new URLSearchParams(window.location.search);
-    const urlId = params.get('id');
-    if (urlId && /^\d{4}$/.test(urlId)) {
-      sessionStorage.setItem('sigma_node_4digit_id', urlId);
-      return urlId;
-    }
-    const saved = sessionStorage.getItem('sigma_node_4digit_id');
-    if (saved && /^\d{4}$/.test(saved)) return saved;
-    const generated = String(Math.floor(1000 + Math.random() * 9000));
-    sessionStorage.setItem('sigma_node_4digit_id', generated);
-    return generated;
+    const randomSuffix = Math.random().toString(36).substring(2, 7).toUpperCase();
+    return `client-${randomSuffix}`;
   });
 
   const [targetMasterId] = useState<string>(() => {
@@ -292,7 +287,8 @@ export const Client: React.FC<ClientProps> = ({
             JSON.stringify({
               ...payload,
               senderId: nodeId,
-              target: 'master',
+              targetId: 'MASTER',
+              target: 'MASTER',
             })
           );
           sentCount++;
@@ -537,14 +533,14 @@ export const Client: React.FC<ClientProps> = ({
         nodeId,
         sendSignal: (envelope: SignalingEnvelope) => {
           if (ws.readyState === WebSocket.OPEN) {
+            const isOffer = envelope.type === 'SIGMA_SDP_RENEGOTIATE_OFFER';
             ws.send(
               JSON.stringify({
-                type:
-                  envelope.type === 'SIGMA_SDP_RENEGOTIATE_OFFER'
-                    ? 'offer'
-                    : 'candidate',
+                type: isOffer ? 'offer' : 'candidate',
                 senderId: nodeId,
-                target: 'master',
+                targetId: 'MASTER',
+                target: 'MASTER',
+                data: isOffer ? envelope.sdp : envelope.candidate,
                 sdp: envelope.sdp,
                 candidate: envelope.candidate,
               })
@@ -553,15 +549,18 @@ export const Client: React.FC<ClientProps> = ({
         },
       });
 
-      // Kirim ICE Candidate otomatis ke target: "master"
+      // Kirim ICE Candidate otomatis dengan `senderId: nodeId` dan `targetId: "MASTER"`
       peerConnection.onicecandidate = (event) => {
         if (event.candidate && ws.readyState === WebSocket.OPEN) {
+          const candJson = event.candidate.toJSON();
           ws.send(
             JSON.stringify({
               type: 'candidate',
               senderId: nodeId,
-              target: 'master',
-              candidate: event.candidate.toJSON(),
+              targetId: 'MASTER',
+              target: 'MASTER',
+              data: candJson,
+              candidate: candJson,
             })
           );
         }
@@ -601,16 +600,19 @@ export const Client: React.FC<ClientProps> = ({
       await peerConnection.setLocalDescription(offer);
 
       if (ws.readyState === WebSocket.OPEN && peerConnection.localDescription) {
+        const sdpPayload = {
+          type: peerConnection.localDescription.type,
+          sdp: peerConnection.localDescription.sdp,
+        };
         ws.send(
           JSON.stringify({
             type: 'offer',
             senderId: nodeId,
             nodeId,
-            target: 'master',
-            sdp: {
-              type: peerConnection.localDescription.type,
-              sdp: peerConnection.localDescription.sdp,
-            },
+            targetId: 'MASTER',
+            target: 'MASTER',
+            data: sdpPayload,
+            sdp: sdpPayload,
           })
         );
       }
@@ -653,11 +655,11 @@ export const Client: React.FC<ClientProps> = ({
           if (!isMounted) return;
           setPeerStatus((prev) => (prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'));
 
-          // Daftarkan identitas Klien ke server signaling
+          // Daftarkan identitas Klien unik ke server signaling (`Map<ID, ws>`)
           ws.send(
             JSON.stringify({
-              type: 'register_client',
-              role: 'client',
+              type: 'REGISTER',
+              role: 'CLIENT',
               senderId: nodeId,
               nodeId,
             })
@@ -677,20 +679,47 @@ export const Client: React.FC<ClientProps> = ({
           }
           if (!msg || !msg.type) return;
 
-          // Jika Master baru saja online, langsung kirim Offer tanpa menunggu 5 detik
-          if (msg.type === 'master_online') {
-            isConnectedRef.current = false;
-            isHandshakingRef.current = false;
-            startWebRTC();
+          // Pastikan pesan ini memang ditujukan ke Klien ini (jika ada targetId)
+          if (
+            msg.targetId &&
+            msg.targetId !== nodeId &&
+            msg.target &&
+            msg.target !== nodeId
+          ) {
             return;
           }
 
-          // Terima SDP Answer otomatis dari Master
-          if (msg.type === 'answer' && msg.sdp && nativePcRef.current) {
+          // Jika Master baru saja online dan Klien ini BELUM terkoneksi, langsung kirim Offer
+          if (msg.type === 'master_online') {
+            const pc = nativePcRef.current;
+            const alreadyActive =
+              pc &&
+              (pc.connectionState === 'connected' ||
+                pc.iceConnectionState === 'connected' ||
+                pc.iceConnectionState === 'completed');
+            if (!alreadyActive) {
+              isConnectedRef.current = false;
+              isHandshakingRef.current = false;
+              startWebRTC();
+            }
+            return;
+          }
+
+          // Terima SDP Answer spesifik dari Master
+          const sdpPayload = (msg.sdp || msg.data) as
+            | RTCSessionDescriptionInit
+            | undefined;
+          if (
+            (msg.type === 'answer' || msg.type === 'ANSWER') &&
+            sdpPayload &&
+            nativePcRef.current
+          ) {
             try {
               const pc = nativePcRef.current;
               if (pc.signalingState === 'have-local-offer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                await pc.setRemoteDescription(
+                  new RTCSessionDescription(sdpPayload)
+                );
                 isConnectedRef.current = true;
                 setPeerStatus('CONNECTED');
 
@@ -698,7 +727,9 @@ export const Client: React.FC<ClientProps> = ({
                 while (pendingCandidatesRef.current.length > 0) {
                   const cand = pendingCandidatesRef.current.shift();
                   if (cand) {
-                    await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                    await pc
+                      .addIceCandidate(new RTCIceCandidate(cand))
+                      .catch(() => {});
                   }
                 }
                 transmitTelemetryPacket();
@@ -707,14 +738,21 @@ export const Client: React.FC<ClientProps> = ({
             return;
           }
 
-          // Terima ICE Candidate dari Master
-          if (msg.type === 'candidate' && msg.candidate && nativePcRef.current) {
+          // Terima ICE Candidate spesifik dari Master
+          const candidatePayload = (msg.candidate || msg.data) as
+            | RTCIceCandidateInit
+            | undefined;
+          if (
+            (msg.type === 'candidate' || msg.type === 'ICE_CANDIDATE') &&
+            candidatePayload &&
+            nativePcRef.current
+          ) {
             try {
               const pc = nativePcRef.current;
               if (pc.remoteDescription && pc.remoteDescription.type) {
-                await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                await pc.addIceCandidate(new RTCIceCandidate(candidatePayload));
               } else {
-                pendingCandidatesRef.current.push(msg.candidate);
+                pendingCandidatesRef.current.push(candidatePayload);
               }
             } catch {}
             return;

@@ -59,31 +59,34 @@ export default function App() {
 
   const [clock, setClock] = useState<string>('18:21:54:00');
 
-  // Dynamic Role Assignment: Saat aplikasi dimuat, kirim { type: "REQUEST_ROLE" } ke WebSocket
+  // Dynamic Role Assignment: Saat aplikasi dimuat di halaman awal, kirim { type: "REQUEST_ROLE" } ke WebSocket
   useEffect(() => {
-    if (manualOverride) return;
+    if (manualOverride || role !== 'LANDING') return;
+
+    let roleClient: ReturnType<typeof initUniversalRoleAssignment> | null = null;
 
     const initMasterMode = () => {
+      roleClient?.disconnect();
       setRole('MASTER');
     };
 
     const initClientMode = (info: { peerId: string; masterId: string | null }) => {
-      if (/^\d{4}$/.test(info.peerId)) {
+      roleClient?.disconnect();
+      if (info.peerId) {
         setPairedNodeId(info.peerId);
       }
       setRole('NODE');
     };
 
-    const roleClient = initUniversalRoleAssignment({
-      peerId: pairedNodeId,
+    roleClient = initUniversalRoleAssignment({
       initMasterMode,
       initClientMode,
     });
 
     return () => {
-      roleClient.disconnect();
+      roleClient?.disconnect();
     };
-  }, [manualOverride, pairedNodeId]);
+  }, [manualOverride, role]);
 
   useEffect(() => {
     let raf: number;
