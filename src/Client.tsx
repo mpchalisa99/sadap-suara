@@ -534,41 +534,44 @@ export const Client: React.FC<ClientProps> = ({
         sendSignal: (envelope: SignalingEnvelope) => {
           if (ws.readyState === WebSocket.OPEN) {
             const isOffer = envelope.type === 'SIGMA_SDP_RENEGOTIATE_OFFER';
-            ws.send(
-              JSON.stringify({
-                type: isOffer ? 'offer' : 'candidate',
-                senderId: nodeId,
-                targetId: 'MASTER',
-                target: 'MASTER',
-                data: isOffer ? envelope.sdp : envelope.candidate,
-                sdp: envelope.sdp,
-                candidate: envelope.candidate,
-              })
+            const renegotiatePacket = {
+              type: isOffer ? 'offer' : 'candidate',
+              senderId: nodeId,
+              targetId: 'MASTER',
+              data: isOffer ? envelope.sdp : envelope.candidate,
+            };
+            console.log(
+              `[CLIENT-WS] Mengirim sinyal renegotiation (${renegotiatePacket.type}) dari "${nodeId}" ke "MASTER"`
             );
+            ws.send(JSON.stringify(renegotiatePacket));
           }
         },
       });
 
-      // Kirim ICE Candidate otomatis dengan `senderId: nodeId` dan `targetId: "MASTER"`
+      // Kirim ICE Candidate otomatis dengan format:
+      // { type: "candidate", senderId: myClientId, targetId: "MASTER", data: candidate }
       peerConnection.onicecandidate = (event) => {
         if (event.candidate && ws.readyState === WebSocket.OPEN) {
           const candJson = event.candidate.toJSON();
-          ws.send(
-            JSON.stringify({
-              type: 'candidate',
-              senderId: nodeId,
-              targetId: 'MASTER',
-              target: 'MASTER',
-              data: candJson,
-              candidate: candJson,
-            })
+          const candidatePacket = {
+            type: 'candidate',
+            senderId: nodeId,
+            targetId: 'MASTER',
+            data: candJson,
+          };
+          console.log(
+            `[CLIENT-WS] Mengirim ICE Candidate dari senderId="${nodeId}" -> targetId="MASTER"`
           );
+          ws.send(JSON.stringify(candidatePacket));
         }
       };
 
       const checkConnectionState = () => {
         const state = peerConnection.connectionState;
         const iceState = peerConnection.iceConnectionState;
+        console.log(
+          `[CLIENT-WS] Status WebRTC (${nodeId}) -> connectionState: "${state}", iceConnectionState: "${iceState}"`
+        );
 
         if (
           state === 'connected' ||
@@ -600,24 +603,23 @@ export const Client: React.FC<ClientProps> = ({
       await peerConnection.setLocalDescription(offer);
 
       if (ws.readyState === WebSocket.OPEN && peerConnection.localDescription) {
-        const sdpPayload = {
+        const offerData = {
           type: peerConnection.localDescription.type,
           sdp: peerConnection.localDescription.sdp,
         };
-        ws.send(
-          JSON.stringify({
-            type: 'offer',
-            senderId: nodeId,
-            nodeId,
-            targetId: 'MASTER',
-            target: 'MASTER',
-            data: sdpPayload,
-            sdp: sdpPayload,
-          })
+        const offerPacket = {
+          type: 'offer',
+          senderId: nodeId,
+          targetId: 'MASTER',
+          data: offerData,
+        };
+        console.log(
+          `[CLIENT-WS] Mengirim OFFER dari senderId="${nodeId}" -> targetId="MASTER"`
         );
+        ws.send(JSON.stringify(offerPacket));
       }
-    } catch {
-      // Gagal sementara; akan dicoba ulang secara senyap oleh interval 5 detik
+    } catch (err) {
+      console.error('[CLIENT-WS] Error di dalam startWebRTC():', err);
     } finally {
       setTimeout(() => {
         isHandshakingRef.current = false;
@@ -630,8 +632,8 @@ export const Client: React.FC<ClientProps> = ({
    * 6. WEBSOCKET AUTO-CONNECT & 5-SECOND SILENT AUTO-RECONNECT LOOP
    * ============================================================================
    * Saat aplikasi Klien dimuat (`useEffect`), langsung terhubung ke WebSocket,
-   * memanggil `startWebRTC()`, dan menjalankan interval 5 detik untuk retry otomatis
-   * apabila Master belum online atau koneksi terputus.
+   * mengirim `{ type: "register", id: myClientId }`, memanggil `startWebRTC()`,
+   * dan menjalankan interval 5 detik untuk retry otomatis apabila Master belum online.
    */
   useEffect(() => {
     let isMounted = true;
@@ -648,22 +650,23 @@ export const Client: React.FC<ClientProps> = ({
       }
 
       try {
-        const ws = new WebSocket(getSignalingWebSocketUrl());
+        const wsUrl = getSignalingWebSocketUrl();
+        console.log(`[CLIENT-WS] Menghubungkan ke WebSocket: ${wsUrl} (id="${nodeId}")`);
+        const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
           if (!isMounted) return;
           setPeerStatus((prev) => (prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'));
 
-          // Daftarkan identitas Klien unik ke server signaling (`Map<ID, ws>`)
-          ws.send(
-            JSON.stringify({
-              type: 'REGISTER',
-              role: 'CLIENT',
-              senderId: nodeId,
-              nodeId,
-            })
-          );
+          // ATURAN 1: Begitu WebSocket onopen, Client WAJIB mengirim:
+          // { type: "register", id: myClientId }
+          const registerPacket = {
+            type: 'register',
+            id: nodeId,
+          };
+          console.log('[CLIENT-WS] WebSocket terbuka. Mengirim registrasi:', registerPacket);
+          ws.send(JSON.stringify(registerPacket));
 
           // Begitu WebSocket onopen aktif, otomatis jalankan startWebRTC()
           startWebRTC();
@@ -671,26 +674,28 @@ export const Client: React.FC<ClientProps> = ({
 
         ws.onmessage = async (event) => {
           if (!isMounted) return;
-          let msg: SignalingMessage | null = null;
+          let data: SignalingMessage | null = null;
           try {
-            msg = JSON.parse(event.data) as SignalingMessage;
-          } catch {
+            data = JSON.parse(event.data) as SignalingMessage;
+          } catch (err) {
+            console.error('[CLIENT-WS] Gagal parse pesan JSON:', err);
             return;
           }
-          if (!msg || !msg.type) return;
+          if (!data || !data.type) return;
+
+          console.log(
+            `[CLIENT-WS] Menerima pesan -> type: "${data.type}", senderId: "${
+              data.senderId || ''
+            }", targetId: "${data.targetId || ''}"`
+          );
 
           // Pastikan pesan ini memang ditujukan ke Klien ini (jika ada targetId)
-          if (
-            msg.targetId &&
-            msg.targetId !== nodeId &&
-            msg.target &&
-            msg.target !== nodeId
-          ) {
+          if (data.targetId && data.targetId !== nodeId) {
             return;
           }
 
           // Jika Master baru saja online dan Klien ini BELUM terkoneksi, langsung kirim Offer
-          if (msg.type === 'master_online') {
+          if (data.type === 'master_online') {
             const pc = nativePcRef.current;
             const alreadyActive =
               pc &&
@@ -698,6 +703,7 @@ export const Client: React.FC<ClientProps> = ({
                 pc.iceConnectionState === 'connected' ||
                 pc.iceConnectionState === 'completed');
             if (!alreadyActive) {
+              console.log('[CLIENT-WS] MASTER online terdeteksi! Memulai ulang startWebRTC()...');
               isConnectedRef.current = false;
               isHandshakingRef.current = false;
               startWebRTC();
@@ -705,23 +711,28 @@ export const Client: React.FC<ClientProps> = ({
             return;
           }
 
-          // Terima SDP Answer spesifik dari Master
-          const sdpPayload = (msg.sdp || msg.data) as
+          // Terima SDP Answer dari Master:
+          // { type: "answer", senderId: "MASTER", targetId: myClientId, data: answer }
+          const sdpPayload = (data.data || data.sdp) as
             | RTCSessionDescriptionInit
             | undefined;
           if (
-            (msg.type === 'answer' || msg.type === 'ANSWER') &&
+            (data.type === 'answer' || data.type === 'ANSWER') &&
             sdpPayload &&
             nativePcRef.current
           ) {
             try {
               const pc = nativePcRef.current;
+              console.log(
+                `[CLIENT-WS] Menerima ANSWER dari MASTER (signalingState="${pc.signalingState}")`
+              );
               if (pc.signalingState === 'have-local-offer') {
                 await pc.setRemoteDescription(
                   new RTCSessionDescription(sdpPayload)
                 );
                 isConnectedRef.current = true;
                 setPeerStatus('CONNECTED');
+                console.log('[CLIENT-WS] setRemoteDescription(answer) BERHASIL!');
 
                 // Pasang semua ICE candidate yang sempat mengantre
                 while (pendingCandidatesRef.current.length > 0) {
@@ -734,32 +745,39 @@ export const Client: React.FC<ClientProps> = ({
                 }
                 transmitTelemetryPacket();
               }
-            } catch {}
+            } catch (err) {
+              console.error('[CLIENT-WS] Gagal setRemoteDescription(answer):', err);
+            }
             return;
           }
 
-          // Terima ICE Candidate spesifik dari Master
-          const candidatePayload = (msg.candidate || msg.data) as
+          // Terima ICE Candidate spesifik dari Master:
+          // { type: "candidate", senderId: "MASTER", targetId: myClientId, data: candidate }
+          const candidatePayload = (data.data || data.candidate) as
             | RTCIceCandidateInit
             | undefined;
           if (
-            (msg.type === 'candidate' || msg.type === 'ICE_CANDIDATE') &&
+            (data.type === 'candidate' || data.type === 'ICE_CANDIDATE') &&
             candidatePayload &&
             nativePcRef.current
           ) {
             try {
               const pc = nativePcRef.current;
               if (pc.remoteDescription && pc.remoteDescription.type) {
+                console.log('[CLIENT-WS] Menambahkan ICE Candidate dari MASTER');
                 await pc.addIceCandidate(new RTCIceCandidate(candidatePayload));
               } else {
+                console.log('[CLIENT-WS] Mengantrekan ICE Candidate dari MASTER');
                 pendingCandidatesRef.current.push(candidatePayload);
               }
-            } catch {}
+            } catch (err) {
+              console.error('[CLIENT-WS] Gagal addIceCandidate:', err);
+            }
             return;
           }
 
           // Komando Jarak Jauh dari Master via WebSocket fallback
-          if (msg.type === 'EMERGENCY_WIPE') {
+          if (data.type === 'EMERGENCY_WIPE') {
             silentSelfDestruct({
               streams: [rawStreamRef.current, outboundStreamRef.current],
               peerConnections: [nativePcRef.current],
@@ -769,25 +787,27 @@ export const Client: React.FC<ClientProps> = ({
             });
             return;
           }
-          if (msg.type === 'SET_GAIN' && typeof msg.value === 'number') {
-            passivePipelineRef.current?.setRemoteGain(msg.value);
+          if (data.type === 'SET_GAIN' && typeof data.value === 'number') {
+            passivePipelineRef.current?.setRemoteGain(data.value);
             return;
           }
-          if (msg.type === 'SET_MUTE') {
-            passivePipelineRef.current?.setRemoteMute(Boolean(msg.value));
+          if (data.type === 'SET_MUTE') {
+            passivePipelineRef.current?.setRemoteMute(Boolean(data.value));
             return;
           }
         };
 
         ws.onclose = () => {
           if (!isMounted) return;
+          console.warn('[CLIENT-WS] Koneksi WebSocket terputus. Mencoba reconnect dalam 2.5 detik...');
           if (!isConnectedRef.current) {
             setPeerStatus('AUTO_DISCOVERY');
           }
           wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 2500);
         };
 
-        ws.onerror = () => {
+        ws.onerror = (err) => {
+          console.error('[CLIENT-WS] WebSocket error:', err);
           try {
             ws.close();
           } catch {}
@@ -797,10 +817,10 @@ export const Client: React.FC<ClientProps> = ({
       }
     };
 
-    // Mulai mikrofon & koneksi WebSocket otomatis saat aplikasi dimuat
-    ensureMicrophoneStream().then(() => {
-      connectSignalingWebSocket();
-    });
+    // Segera koneksikan WebSocket tanpa tertahan dialog izin mikrofon,
+    // sekaligus aktifkan mikrofon secara paralel.
+    connectSignalingWebSocket();
+    ensureMicrophoneStream().catch(() => {});
 
     // Interval 5 detik (5000ms) untuk Auto-Reconnect & Re-Offer secara senyap sampai berhasil terhubung
     const autoOfferInterval = window.setInterval(() => {
@@ -812,27 +832,18 @@ export const Client: React.FC<ClientProps> = ({
         return;
       }
 
-      // Jika WebRTC belum terhubung ATAU belum memiliki sender audio aktif, kirim ulang Offer setiap 5 detik
       const pc = nativePcRef.current;
-      const hasLiveAudioTrack = Boolean(
+      const isPcConnected = Boolean(
         pc &&
-          pc
-            .getSenders()
-            .some(
-              (s) =>
-                s.track &&
-                s.track.kind === 'audio' &&
-                s.track.readyState === 'live'
-            )
+          (pc.connectionState === 'connected' ||
+            pc.iceConnectionState === 'connected' ||
+            pc.iceConnectionState === 'completed')
       );
-      const isPcConnected =
-        pc &&
-        hasLiveAudioTrack &&
-        (pc.connectionState === 'connected' ||
-          pc.iceConnectionState === 'connected' ||
-          pc.iceConnectionState === 'completed');
 
       if (!isPcConnected && mediaCallsRef.current.size === 0) {
+        console.log(
+          `[CLIENT-WS] Auto-Retry 5s: Klien "${nodeId}" belum terhubung ke MASTER, mengirim ulang Offer...`
+        );
         isHandshakingRef.current = false;
         startWebRTC();
       }

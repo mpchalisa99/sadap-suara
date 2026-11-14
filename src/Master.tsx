@@ -1091,13 +1091,12 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
         ws.onopen = () => {
           if (!isMounted) return;
-          ws.send(
-            JSON.stringify({
-              type: 'REGISTER',
-              role: 'MASTER',
-              senderId: 'MASTER',
-            })
-          );
+          const regPayload = {
+            type: 'register',
+            id: 'MASTER',
+          };
+          console.log('[MASTER-WS] WebSocket terbuka. Mengirim registrasi:', regPayload);
+          ws.send(JSON.stringify(regPayload));
           setConnectionBanner(
             'MASTER ONLINE (ID: MASTER) · SIAP MENERIMA HINGGA 5 KLIEN BERSAMAAN'
           );
@@ -1105,29 +1104,41 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
         ws.onmessage = async (event) => {
           if (!isMounted) return;
-          let msg: Record<string, unknown> | null = null;
+          let data: Record<string, unknown> | null = null;
           try {
-            msg = JSON.parse(event.data) as Record<string, unknown>;
-          } catch {
+            data = JSON.parse(event.data) as Record<string, unknown>;
+          } catch (err) {
+            console.error('[MASTER-WS] Gagal parse pesan JSON:', err);
             return;
           }
-          if (!msg || typeof msg.type !== 'string') return;
+          if (!data || typeof data.type !== 'string') return;
 
           const senderId = String(
-            msg.senderId || msg.clientId || msg.nodeId || ''
+            data.senderId || data.id || data.clientId || data.nodeId || ''
           ).replace('sigma-node-', '');
+
+          console.log(
+            `[MASTER-WS] Menerima pesan -> type: "${data.type}", senderId: "${senderId}", targetId: "${
+              data.targetId || ''
+            }"`
+          );
+
           if (!senderId || senderId.toUpperCase() === 'MASTER') return;
 
           // A. Tangani Paket Telemetri GPS dari Klien
-          if (msg.type === 'SIGMA_TELEMETRY') {
+          if (data.type === 'SIGMA_TELEMETRY') {
             handlersRef.current.handleIncomingTelemetry(
-              msg as unknown as TelemetryPayload
+              data as unknown as TelemetryPayload
             );
             return;
           }
 
           // B. Tangani Notifikasi Putusnya Klien spesifik (`senderId`)
-          if (msg.type === 'client_disconnected') {
+          if (
+            data.type === 'client_disconnected' ||
+            data.type === 'CLIENT_DISCONNECTED'
+          ) {
+            console.log(`[MASTER-WS] Klien "${senderId}" terputus. Membersihkan slot.`);
             const oldPc = pcMap.get(senderId);
             if (oldPc) {
               try {
@@ -1141,12 +1152,12 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             return;
           }
 
-          // C. Terima SDP OFFER dari Klien (`senderId`)
-          const offerPayload = (msg.sdp || msg.data) as
+          // C. Terima SDP OFFER dari Klien (`{ type: "offer", senderId, targetId: "MASTER", data: offer }`)
+          const offerPayload = (data.data || data.sdp) as
             | RTCSessionDescriptionInit
             | undefined;
           if (
-            (msg.type === 'offer' || msg.type === 'OFFER') &&
+            (data.type === 'offer' || data.type === 'OFFER') &&
             offerPayload
           ) {
             const isExisting =
@@ -1154,6 +1165,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               clientsRef.current.some((c) => c.nodeId === senderId);
 
             if (!isExisting && pcMap.size >= MAX_CLIENTS) {
+              console.warn(
+                `[MASTER-WS] Menolak Offer dari "${senderId}" karena slot penuh (${MAX_CLIENTS} Klien).`
+              );
               return;
             }
 
@@ -1171,6 +1185,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               pcMap.delete(senderId);
             }
 
+            console.log(
+              `[MASTER-WS] Membuat RTCPeerConnection baru untuk senderId="${senderId}"`
+            );
             const pc = new RTCPeerConnection(RTC_CONFIG);
             // Simpan di dalam `peerConnections.current` (Map di dalam useRef)
             pcMap.set(senderId, pc);
@@ -1183,25 +1200,28 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               `HANDSHAKE MULTI-PEER: MENERIMA OFFER DARI (${senderId}) · TOTAL: ${pcMap.size} KLIEN`
             );
 
-            // Kirim ICE Candidate Master HANYA ke `targetId: senderId`
+            // Kirim ICE Candidate Master kembali spesifik ke `targetId: senderId`
             pc.onicecandidate = (iceEvent) => {
               if (iceEvent.candidate && ws.readyState === WebSocket.OPEN) {
-                const candJson = iceEvent.candidate.toJSON();
-                ws.send(
-                  JSON.stringify({
-                    type: 'candidate',
-                    senderId: 'MASTER',
-                    targetId: senderId,
-                    target: senderId,
-                    data: candJson,
-                    candidate: candJson,
-                  })
+                const candidateJson = iceEvent.candidate.toJSON();
+                const candidatePacket = {
+                  type: 'candidate',
+                  senderId: 'MASTER',
+                  targetId: senderId,
+                  data: candidateJson,
+                };
+                console.log(
+                  `[MASTER-WS] Mengirim ICE Candidate ke targetId="${senderId}"`
                 );
+                ws.send(JSON.stringify(candidatePacket));
               }
             };
 
             // Saat `ontrack` dari Klien masuk, tambahkan `{ id: senderId, stream }` ke `clientStreams`
             pc.ontrack = (trackEvent: RTCTrackEvent) => {
+              console.log(
+                `[MASTER-WS] EVENT ontrack DITERIMA dari senderId="${senderId}"! Track kind="${trackEvent.track.kind}"`
+              );
               const inboundStream =
                 trackEvent.streams && trackEvent.streams[0]
                   ? trackEvent.streams[0]
@@ -1230,6 +1250,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
             // Tangkap RTCDataChannel untuk GPS spesifik per `senderId`
             pc.ondatachannel = (dcEvent) => {
+              console.log(
+                `[MASTER-WS] DataChannel terbuka dari senderId="${senderId}"`
+              );
               const channel = dcEvent.channel;
               dcMap.set(senderId, channel);
               channel.onmessage = (msgEv) => {
@@ -1244,6 +1267,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             pc.oniceconnectionstatechange = () => {
               if (pcMap.get(senderId) !== pc) return;
               const st = pc.iceConnectionState;
+              console.log(
+                `[MASTER-WS] iceConnectionState untuk "${senderId}": ${st}`
+              );
               if (st === 'failed' || st === 'closed') {
                 pcMap.delete(senderId);
                 dcMap.delete(senderId);
@@ -1272,39 +1298,54 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               await pc.setLocalDescription(answer);
 
               if (ws.readyState === WebSocket.OPEN && pc.localDescription) {
-                const answerSdp = {
-                  type: pc.localDescription.type,
-                  sdp: pc.localDescription.sdp,
+                const answerPacket = {
+                  type: 'answer',
+                  senderId: 'MASTER',
+                  targetId: senderId,
+                  data: {
+                    type: pc.localDescription.type,
+                    sdp: pc.localDescription.sdp,
+                  },
                 };
-                ws.send(
-                  JSON.stringify({
-                    type: 'answer',
-                    senderId: 'MASTER',
-                    targetId: senderId,
-                    target: senderId,
-                    data: answerSdp,
-                    sdp: answerSdp,
-                  })
+                console.log(
+                  `[MASTER-WS] Mengirim ANSWER balik ke targetId="${senderId}"`
                 );
+                ws.send(JSON.stringify(answerPacket));
               }
-            } catch {}
+            } catch (err) {
+              console.error(
+                `[MASTER-WS] Gagal memproses Offer dari "${senderId}":`,
+                err
+              );
+            }
             return;
           }
 
           // D. Terima ICE Candidate dari `senderId` dan tambahkan HANYA ke `pcMap.get(senderId)`
-          const candidatePayload = (msg.candidate || msg.data) as
+          const candidatePayload = (data.data || data.candidate) as
             | RTCIceCandidateInit
             | undefined;
           if (
-            (msg.type === 'candidate' || msg.type === 'ICE_CANDIDATE') &&
+            (data.type === 'candidate' || data.type === 'ICE_CANDIDATE') &&
             candidatePayload
           ) {
             const pc = pcMap.get(senderId);
             if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+              console.log(
+                `[MASTER-WS] Menambahkan ICE Candidate ke peerConnections.get("${senderId}")`
+              );
               await pc
                 .addIceCandidate(new RTCIceCandidate(candidatePayload))
-                .catch(() => {});
+                .catch((err) => {
+                  console.error(
+                    `[MASTER-WS] Gagal addIceCandidate untuk "${senderId}":`,
+                    err
+                  );
+                });
             } else {
+              console.log(
+                `[MASTER-WS] Mengantrekan ICE Candidate untuk "${senderId}" (RemoteDescription belum siap)`
+              );
               const list = candQueueMap.get(senderId) || [];
               list.push(candidatePayload);
               candQueueMap.set(senderId, list);
@@ -1372,7 +1413,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         incomingCall.metadata?.nodeId ||
         incomingCall.peer.replace('sigma-node-', '');
 
-      if (/^\d{4}$/.test(metaNodeId)) {
+      if (metaNodeId) {
         const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
         if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
 
@@ -1399,7 +1440,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     peer.on('connection', (conn) => {
       const metaNodeId =
         conn.metadata?.nodeId || conn.peer.replace('sigma-node-', '');
-      if (/^\d{4}$/.test(metaNodeId)) {
+      if (metaNodeId) {
         const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
         if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
         registerDataConnection(metaNodeId, conn);
