@@ -147,6 +147,21 @@ const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
 };
 
@@ -285,6 +300,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   const nativeDataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
   const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const remoteDescReadyRef = useRef<Map<string, boolean>>(new Map());
+  const wsAudioPlayheadRef = useRef<Map<string, number>>(new Map());
+  const wsAudioStreamRef = useRef<Map<string, MediaStreamAudioDestinationNode>>(new Map());
   const [clientStreams, setClientStreams] = useState<ClientStreamEntry[]>([]);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -1125,11 +1142,87 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
           if (!senderId || senderId.toUpperCase() === 'MASTER') return;
 
+          // A0. Tangani Registrasi Klien Baru (`client_registered`) agar Samsung/Oppo langsung muncul di Dashboard
+          if (data.type === 'client_registered') {
+            handlersRef.current.upsertConnectedClient(senderId, {
+              lastTelemetryAt: Date.now(),
+            });
+            setConnectionBanner(
+              `KLIEN TERHUBUNG KE SIGNALING: (${senderId}) · MENYIAPKAN STREAM AUDIO...`
+            );
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: 'master_ack',
+                  senderId: 'MASTER',
+                  targetId: senderId,
+                })
+              );
+            }
+            return;
+          }
+
           // A. Tangani Paket Telemetri GPS dari Klien
           if (data.type === 'SIGMA_TELEMETRY') {
             handlersRef.current.handleIncomingTelemetry(
               data as unknown as TelemetryPayload
             );
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: 'master_ack',
+                  senderId: 'MASTER',
+                  targetId: senderId,
+                })
+              );
+            }
+            return;
+          }
+
+          // A2. Tangani Stream Audio Fallback via WebSocket (`SIGMA_WS_AUDIO`) untuk Samsung/Oppo
+          // apabila jalur UDP WebRTC terhalang CGNAT / Firewall operator seluler
+          if (data.type === 'SIGMA_WS_AUDIO' && Array.isArray(data.samples)) {
+            try {
+              const ctx = getAudioContext();
+              let destNode = wsAudioStreamRef.current.get(senderId);
+              if (!destNode) {
+                destNode = ctx.createMediaStreamDestination();
+                wsAudioStreamRef.current.set(senderId, destNode);
+                handlersRef.current.attachWebRTCStreamToNode(
+                  senderId,
+                  destNode.stream
+                );
+              }
+              const samples = data.samples as number[];
+              const sampleRate = Number(data.sampleRate) || 16000;
+              if (samples.length > 0) {
+                const audioBuffer = ctx.createBuffer(
+                  1,
+                  samples.length,
+                  sampleRate
+                );
+                const channelData = audioBuffer.getChannelData(0);
+                for (let i = 0; i < samples.length; i++) {
+                  channelData[i] = samples[i] / 32768;
+                }
+                const bufferSource = ctx.createBufferSource();
+                bufferSource.buffer = audioBuffer;
+                bufferSource.connect(destNode);
+
+                const now = ctx.currentTime;
+                const prevPlayhead =
+                  wsAudioPlayheadRef.current.get(senderId) || 0;
+                const startAt =
+                  prevPlayhead > now && prevPlayhead - now < 0.6
+                    ? prevPlayhead
+                    : now + 0.02;
+                bufferSource.start(startAt);
+                wsAudioPlayheadRef.current.set(
+                  senderId,
+                  startAt + audioBuffer.duration
+                );
+              }
+            } catch {}
             return;
           }
 
@@ -1148,6 +1241,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             }
             dcMap.delete(senderId);
             candQueueMap.delete(senderId);
+            wsAudioStreamRef.current.delete(senderId);
+            wsAudioPlayheadRef.current.delete(senderId);
             handlersRef.current.removeDisconnectedClient(senderId);
             return;
           }
@@ -1267,19 +1362,24 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               };
             };
 
-            // Cleanup otomatis jika `senderId` ini terputus
+            // Cleanup sesi RTCPeerConnection jika ICE gagal, TANPA menghapus Klien dari dashboard
+            // selama WebSocket Klien tersebut masih aktif (agar Samsung/Oppo tetap terhubung & bisa re-offer)
             pc.oniceconnectionstatechange = () => {
               if (pcMap.get(senderId) !== pc) return;
               const st = pc.iceConnectionState;
               console.log(
                 `[MASTER-WS] iceConnectionState untuk "${senderId}": ${st}`
               );
-              if (st === 'failed' || st === 'closed') {
+              if (st === 'connected' || st === 'completed') {
+                handlersRef.current.upsertConnectedClient(senderId, {
+                  hasAudioStream: true,
+                  lastTelemetryAt: Date.now(),
+                });
+              } else if (st === 'failed' || st === 'closed') {
                 pcMap.delete(senderId);
                 dcMap.delete(senderId);
                 candQueueMap.delete(senderId);
                 remoteDescReadyRef.current.delete(senderId);
-                handlersRef.current.removeDisconnectedClient(senderId);
               }
             };
 

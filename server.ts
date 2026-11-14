@@ -170,14 +170,14 @@ async function startServer() {
             }
           });
         } else {
-          // Jika Client baru register dan MASTER sudah online, beri tahu Client bahwa MASTER siap
+          // Beri tahu MASTER bahwa Client baru saja terdaftar dan siap bernegosiasi
           const masterWs = clients.get('MASTER');
           if (masterWs && masterWs.readyState === WebSocket.OPEN) {
-            ws.send(
+            masterWs.send(
               JSON.stringify({
-                type: 'master_online',
-                senderId: 'MASTER',
-                targetId: normalizedId,
+                type: 'client_registered',
+                senderId: normalizedId,
+                targetId: 'MASTER',
               })
             );
           }
