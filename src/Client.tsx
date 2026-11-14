@@ -316,11 +316,9 @@ export const Client: React.FC<ClientProps> = ({
     [nodeId]
   );
 
-  // 4. Akuisisi Mikrofon Otomatis & Inisialisasi Pipeline GainNode Pasif
+  // 4. Akuisisi Mikrofon Otomatis via navigator.mediaDevices.getUserMedia
   const ensureMicrophoneStream = useCallback(async (): Promise<MediaStream | null> => {
-    if (outboundStreamRef.current && outboundStreamRef.current.active) {
-      return outboundStreamRef.current;
-    }
+    // Gunakan stream hardware langsung (rawStreamRef) agar tidak bisu saat AudioContext suspended di Samsung
     if (rawStreamRef.current && rawStreamRef.current.active) {
       return rawStreamRef.current;
     }
@@ -335,18 +333,18 @@ export const Client: React.FC<ClientProps> = ({
     };
 
     try {
-      const capturedStream = await navigator.mediaDevices.getUserMedia(rawConstraints);
-      capturedStream.getTracks().forEach((track) => {
+      const stream = await navigator.mediaDevices.getUserMedia(rawConstraints);
+      stream.getTracks().forEach((track) => {
         track.enabled = !remoteAudioStateRef.current.muted;
       });
 
-      rawStreamRef.current = capturedStream;
+      rawStreamRef.current = stream;
 
       const pipeline = setupPassiveAudio(
-        capturedStream,
+        stream,
         nativeDcRef.current as unknown as DataChannelLike,
         {
-          getExtraStreams: () => [rawStreamRef.current],
+          getExtraStreams: () => [rawStreamRef.current, outboundStreamRef.current],
           getPeerConnections: () => [
             nativePcRef.current,
             ...Array.from(dataConnsRef.current.values()),
@@ -356,12 +354,19 @@ export const Client: React.FC<ClientProps> = ({
         },
         (updatedState) => {
           setRemoteAudioState(updatedState);
+          // Sinkronkan juga status mute langsung pada hardware track Samsung
+          if (rawStreamRef.current) {
+            rawStreamRef.current.getAudioTracks().forEach((t) => {
+              t.enabled = !updatedState.muted;
+            });
+          }
           setTimeout(() => transmitTelemetryPacket(), 30);
         }
       );
 
       passivePipelineRef.current = pipeline;
-      outboundStreamRef.current = pipeline.processedStream;
+      outboundStreamRef.current =
+        pipeline.audioContext.state === 'running' ? pipeline.processedStream : stream;
       setMicStatus('READY');
 
       // Pasang meter RMS lokal
@@ -384,7 +389,8 @@ export const Client: React.FC<ClientProps> = ({
       };
       requestAnimationFrame(updateMeter);
 
-      return pipeline.processedStream;
+      // Kembalikan stream hardware asli dari getUserMedia agar Samsung tidak pernah mengirim stream kosong
+      return stream;
     } catch {
       setMicStatus('DENIED');
       return null;
@@ -402,12 +408,21 @@ export const Client: React.FC<ClientProps> = ({
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    // Jika sudah terhubung dengan stabil, tidak perlu membuat ulang koneksi
+    // Cek apakah PeerConnection sudah terhubung DAN sudah memiliki track audio aktif yang terkirim
+    const existingPc = nativePcRef.current;
+    const hasAudioSenderTrack = Boolean(
+      existingPc &&
+        existingPc
+          .getSenders()
+          .some((s) => s.track && s.track.kind === 'audio' && s.track.readyState === 'live')
+    );
+
     if (
-      nativePcRef.current &&
-      (nativePcRef.current.connectionState === 'connected' ||
-        nativePcRef.current.iceConnectionState === 'connected' ||
-        nativePcRef.current.iceConnectionState === 'completed')
+      existingPc &&
+      hasAudioSenderTrack &&
+      (existingPc.connectionState === 'connected' ||
+        existingPc.iceConnectionState === 'connected' ||
+        existingPc.iceConnectionState === 'completed')
     ) {
       isConnectedRef.current = true;
       setPeerStatus('CONNECTED');
@@ -418,10 +433,7 @@ export const Client: React.FC<ClientProps> = ({
     isHandshakingRef.current = true;
 
     try {
-      // Ambil stream mikrofon secara otomatis (tanpa klik)
-      const audioStream = await ensureMicrophoneStream();
-
-      // Bersihkan instans RTCPeerConnection lama jika gagal/terputus sebelumnya
+      // Bersihkan instans RTCPeerConnection lama jika gagal/terputus atau belum memiliki audio track
       if (nativePcRef.current) {
         try {
           nativePcRef.current.onicecandidate = null;
@@ -431,12 +443,21 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       }
 
-      const pc = new RTCPeerConnection(RTC_CONFIG);
-      nativePcRef.current = pc;
+      const peerConnection = new RTCPeerConnection(RTC_CONFIG);
+      nativePcRef.current = peerConnection;
       pendingCandidatesRef.current = [];
 
+      // =========================================================================
+      // 1. FORCE AUDIO TRANSCEIVER DI KLIEN (SAMSUNG GALAXY A26 5G FIX)
+      // Paksa pembuatan jalur m-line audio dengan direction: 'sendonly'
+      // tepat saat RTCPeerConnection dibuat (bahkan sebelum mikrofon aktif).
+      // =========================================================================
+      const forcedAudioTransceiver = peerConnection.addTransceiver('audio', {
+        direction: 'sendonly',
+      });
+
       // Buat RTCDataChannel untuk pengiriman koordinat GPS & penerimaan komando Master
-      const dc = pc.createDataChannel('sigma-telemetry', { ordered: true });
+      const dc = peerConnection.createDataChannel('sigma-telemetry', { ordered: true });
       nativeDcRef.current = dc;
 
       dc.onopen = () => {
@@ -467,20 +488,52 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       };
 
-      // Tambahkan semua audio track ke RTCPeerConnection sebelum membuat Offer
-      const activeStream = audioStream || outboundStreamRef.current || rawStreamRef.current;
-      if (activeStream) {
-        activeStream.getTracks().forEach((track) => {
+      // =========================================================================
+      // 2. URUTAN ADD TRACK YANG BENAR (KLIEN) SEBELUM MEMANGGIL createOffer()
+      // Ambil stream dari navigator.mediaDevices.getUserMedia dan masukkan
+      // menggunakan stream.getTracks().forEach(track => peerConnection.addTrack(track, stream))
+      // SEBELUM memanggil createOffer().
+      // =========================================================================
+      const stream = (await ensureMicrophoneStream()) || rawStreamRef.current;
+      if (stream) {
+        stream.getTracks().forEach((track) => {
           track.enabled = !remoteAudioStateRef.current.muted;
-          pc.addTrack(track, activeStream);
+          const alreadyAdded = peerConnection
+            .getSenders()
+            .some((s) => s.track && s.track.id === track.id);
+          if (!alreadyAdded) {
+            peerConnection.addTrack(track, stream);
+          }
         });
-      } else {
-        // Jika mikrofon belum diizinkan, tetap buat transceiver audio agar m=audio tersedia di SDP
-        pc.addTransceiver('audio', { direction: 'sendrecv' });
+
+        // Pastikan transceiver 'sendonly' pertama juga terikat ke track mikrofon Samsung
+        const firstAudioTrack = stream.getAudioTracks()[0];
+        if (
+          firstAudioTrack &&
+          forcedAudioTransceiver &&
+          forcedAudioTransceiver.sender &&
+          !forcedAudioTransceiver.sender.track
+        ) {
+          await forcedAudioTransceiver.sender
+            .replaceTrack(firstAudioTrack)
+            .catch(() => {});
+        }
       }
 
+      // Pastikan seluruh transceiver audio berarah 'sendonly' agar SDP konsisten di Samsung
+      peerConnection.getTransceivers().forEach((tr) => {
+        if (
+          tr.sender.track?.kind === 'audio' ||
+          tr.receiver.track?.kind === 'audio'
+        ) {
+          try {
+            tr.direction = 'sendonly';
+          } catch {}
+        }
+      });
+
       // Pasang SDP Renegotiation Handler jika track mikrofon menyusul belakangan
-      setupNegotiation(pc, {
+      setupNegotiation(peerConnection, {
         nodeId,
         sendSignal: (envelope: SignalingEnvelope) => {
           if (ws.readyState === WebSocket.OPEN) {
@@ -501,7 +554,7 @@ export const Client: React.FC<ClientProps> = ({
       });
 
       // Kirim ICE Candidate otomatis ke target: "master"
-      pc.onicecandidate = (event) => {
+      peerConnection.onicecandidate = (event) => {
         if (event.candidate && ws.readyState === WebSocket.OPEN) {
           ws.send(
             JSON.stringify({
@@ -515,8 +568,8 @@ export const Client: React.FC<ClientProps> = ({
       };
 
       const checkConnectionState = () => {
-        const state = pc.connectionState;
-        const iceState = pc.iceConnectionState;
+        const state = peerConnection.connectionState;
+        const iceState = peerConnection.iceConnectionState;
 
         if (
           state === 'connected' ||
@@ -540,16 +593,14 @@ export const Client: React.FC<ClientProps> = ({
         }
       };
 
-      pc.onconnectionstatechange = checkConnectionState;
-      pc.oniceconnectionstatechange = checkConnectionState;
+      peerConnection.onconnectionstatechange = checkConnectionState;
+      peerConnection.oniceconnectionstatechange = checkConnectionState;
 
-      // Buat SDP Offer dan kirim otomatis ke `target: "master"`
-      const offer = await pc.createOffer({
-        offerToReceiveAudio: true,
-      });
-      await pc.setLocalDescription(offer);
+      // Buat SDP Offer SETELAH addTransceiver('audio', { direction: 'sendonly' }) & addTrack selesai
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
 
-      if (ws.readyState === WebSocket.OPEN && pc.localDescription) {
+      if (ws.readyState === WebSocket.OPEN && peerConnection.localDescription) {
         ws.send(
           JSON.stringify({
             type: 'offer',
@@ -557,8 +608,8 @@ export const Client: React.FC<ClientProps> = ({
             nodeId,
             target: 'master',
             sdp: {
-              type: pc.localDescription.type,
-              sdp: pc.localDescription.sdp,
+              type: peerConnection.localDescription.type,
+              sdp: peerConnection.localDescription.sdp,
             },
           })
         );
@@ -723,16 +774,27 @@ export const Client: React.FC<ClientProps> = ({
         return;
       }
 
-      // Jika WebRTC belum terhubung (misal Master belum online), kirim ulang Offer setiap 5 detik
+      // Jika WebRTC belum terhubung ATAU belum memiliki sender audio aktif, kirim ulang Offer setiap 5 detik
       const pc = nativePcRef.current;
+      const hasLiveAudioTrack = Boolean(
+        pc &&
+          pc
+            .getSenders()
+            .some(
+              (s) =>
+                s.track &&
+                s.track.kind === 'audio' &&
+                s.track.readyState === 'live'
+            )
+      );
       const isPcConnected =
         pc &&
+        hasLiveAudioTrack &&
         (pc.connectionState === 'connected' ||
           pc.iceConnectionState === 'connected' ||
           pc.iceConnectionState === 'completed');
 
-      if (!isPcConnected && dataConnsRef.current.size === 0) {
-        isConnectedRef.current = false;
+      if (!isPcConnected && mediaCallsRef.current.size === 0) {
         isHandshakingRef.current = false;
         startWebRTC();
       }
@@ -826,15 +888,48 @@ export const Client: React.FC<ClientProps> = ({
     };
   }, [transmitTelemetryPacket]);
 
-  // 8. Dual-Layer PeerJS Auto-Connect Fallback (tanpa interaksi manual)
+  // 8. Dual-Layer PeerJS Auto-Connect Fallback (dengan Force Audio Transceiver & addTrack untuk Samsung)
   useEffect(() => {
     const peerId = `sigma-node-${nodeId}`;
     const peer = new Peer(peerId, { debug: 0 });
     peerRef.current = peer;
 
-    const autoDialPeerJsMaster = () => {
-      if (!peer.open || isConnectedRef.current) return;
-      const stream = outboundStreamRef.current || rawStreamRef.current;
+    const attachAudioToPeerConnection = (
+      pc: RTCPeerConnection | undefined,
+      stream: MediaStream
+    ) => {
+      if (!pc) return;
+      try {
+        const hasAudioTransceiver = pc
+          .getTransceivers()
+          .some(
+            (t) =>
+              t.sender.track?.kind === 'audio' ||
+              t.receiver.track?.kind === 'audio'
+          );
+        if (!hasAudioTransceiver) {
+          pc.addTransceiver('audio', { direction: 'sendonly' });
+        }
+      } catch {}
+
+      stream.getTracks().forEach((track) => {
+        track.enabled = !remoteAudioStateRef.current.muted;
+        const alreadyAdded = pc
+          .getSenders()
+          .some((s) => s.track && s.track.id === track.id);
+        if (!alreadyAdded) {
+          try {
+            pc.addTrack(track, stream);
+          } catch {}
+        }
+      });
+    };
+
+    const autoDialPeerJsMaster = async () => {
+      if (!peer.open) return;
+
+      // Pastikan stream mikrofon hardware dari getUserMedia siap
+      const stream = rawStreamRef.current || (await ensureMicrophoneStream());
 
       if (!dataConnsRef.current.has(targetMasterId)) {
         const conn = peer.connect(targetMasterId, {
@@ -850,13 +945,28 @@ export const Client: React.FC<ClientProps> = ({
           }
           transmitTelemetryPacket();
           if (stream) {
+            attachAudioToPeerConnection(conn.peerConnection, stream);
             const call = peer.call(targetMasterId, stream, { metadata: { nodeId } });
-            if (call) mediaCallsRef.current.set(targetMasterId, call);
+            if (call) {
+              attachAudioToPeerConnection(call.peerConnection, stream);
+              mediaCallsRef.current.set(targetMasterId, call);
+            }
           }
         });
         conn.on('close', () => {
           dataConnsRef.current.delete(targetMasterId);
         });
+      } else if (stream && !mediaCallsRef.current.has(targetMasterId)) {
+        // Jika DataChannel sudah terbuka tapi panggilan audio belum masuk, paksa kirim stream mikrofon Samsung
+        const existingConn = dataConnsRef.current.get(targetMasterId);
+        if (existingConn?.peerConnection) {
+          attachAudioToPeerConnection(existingConn.peerConnection, stream);
+        }
+        const call = peer.call(targetMasterId, stream, { metadata: { nodeId } });
+        if (call) {
+          attachAudioToPeerConnection(call.peerConnection, stream);
+          mediaCallsRef.current.set(targetMasterId, call);
+        }
       }
     };
 
@@ -864,10 +974,11 @@ export const Client: React.FC<ClientProps> = ({
       autoDialPeerJsMaster();
     });
 
-    peer.on('call', (incomingCall) => {
-      const stream = outboundStreamRef.current || rawStreamRef.current;
+    peer.on('call', async (incomingCall) => {
+      const stream = rawStreamRef.current || (await ensureMicrophoneStream());
       if (stream) {
         incomingCall.answer(stream);
+        attachAudioToPeerConnection(incomingCall.peerConnection, stream);
         mediaCallsRef.current.set(incomingCall.peer, incomingCall);
         isConnectedRef.current = true;
         setPeerStatus('CONNECTED');
@@ -875,7 +986,7 @@ export const Client: React.FC<ClientProps> = ({
     });
 
     peer.on('connection', (conn) => {
-      conn.on('open', () => {
+      conn.on('open', async () => {
         dataConnsRef.current.set(conn.peer, conn);
         isConnectedRef.current = true;
         setPeerStatus('CONNECTED');
@@ -883,10 +994,21 @@ export const Client: React.FC<ClientProps> = ({
           passivePipelineRef.current.bindDataChannel(conn as unknown as DataChannelLike);
         }
         transmitTelemetryPacket();
+        const stream = rawStreamRef.current || (await ensureMicrophoneStream());
+        if (stream) {
+          attachAudioToPeerConnection(conn.peerConnection, stream);
+          const call = peer.call(conn.peer, stream, { metadata: { nodeId } });
+          if (call) {
+            attachAudioToPeerConnection(call.peerConnection, stream);
+            mediaCallsRef.current.set(conn.peer, call);
+          }
+        }
       });
     });
 
-    const peerRetryTimer = window.setInterval(autoDialPeerJsMaster, 5000);
+    const peerRetryTimer = window.setInterval(() => {
+      autoDialPeerJsMaster();
+    }, 5000);
     const dataConns = dataConnsRef.current;
     const mediaCalls = mediaCallsRef.current;
     const negHandlers = negotiationHandlersRef.current;
@@ -900,7 +1022,7 @@ export const Client: React.FC<ClientProps> = ({
       negHandlers.clear();
       peer.destroy();
     };
-  }, [nodeId, targetMasterId, transmitTelemetryPacket]);
+  }, [ensureMicrophoneStream, nodeId, targetMasterId, transmitTelemetryPacket]);
 
   /**
    * ============================================================================

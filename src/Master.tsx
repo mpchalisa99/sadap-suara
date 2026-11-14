@@ -631,8 +631,23 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       const ctx = getAudioContext();
 
       const existing = pipelinesRef.current.get(nodeId);
-      if (existing && existing.stream.id === remoteStream.id) {
-        // Stream yang sama sudah terpasang; cukup pastikan <audio> diputar
+      const existingTrackSig = existing
+        ? existing.stream
+            .getAudioTracks()
+            .map((t) => t.id)
+            .join(',')
+        : '';
+      const incomingTrackSig = remoteStream
+        .getAudioTracks()
+        .map((t) => t.id)
+        .join(',');
+
+      if (
+        existing &&
+        existing.stream.id === remoteStream.id &&
+        existingTrackSig === incomingTrackSig
+      ) {
+        // Stream dan daftar track yang sama sudah terpasang; cukup pastikan <audio> diputar
         unlockAllAudioPlayback();
         return;
       }
@@ -1617,6 +1632,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           connectToRemoteNode(scannedId);
         }}
       />
+
+      {/* Dedicated DOM container untuk menampung elemen <audio id="audio-client-{clientId}" autoplay playsinline> unik per Klien */}
+      <div id="master-multi-audio-stage" />
 
       {/* Hidden audio element for Recordings Log playback */}
       <audio

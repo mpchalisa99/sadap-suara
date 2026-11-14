@@ -254,35 +254,66 @@ export function setupNegotiation(
  * scheduler di Android sering menghentikan decoding untuk elemen yang disembunyikan penuh.
  * Sebagai gantinya, gunakan ukuran 1x1px offscreen dengan opacity minimal.
  */
+// Registry internal untuk melacak MediaStream gabungan per clientId agar multi-transceiver tidak saling menimpa
+const clientCompositeStreams = new Map<string, MediaStream>();
+
 export function handleIncomingAudio(
   event: RTCTrackEvent | { streams?: readonly MediaStream[]; track?: MediaStreamTrack },
   options: HandleIncomingAudioOptions = {}
 ): HTMLAudioElement | null {
   // Ekstrak MediaStream dari event.streams[0] atau buat dari event.track
-  const incomingStream =
+  const rawIncomingStream =
     event.streams && event.streams[0]
       ? event.streams[0]
       : event.track
       ? new MediaStream([event.track])
       : null;
 
-  if (!incomingStream) return null;
+  if (!rawIncomingStream && !event.track) return null;
 
-  // Pastikan seluruh audio track dalam keadaan enabled = true
-  incomingStream.getAudioTracks().forEach((track) => {
-    track.enabled = true;
-  });
+  const clientId =
+    options.audioId ||
+    rawIncomingStream?.id ||
+    event.track?.id ||
+    `peer-${Date.now()}`;
+  const domId = `audio-client-${clientId}`;
 
-  const elementKey = options.audioId || incomingStream.id || 'default-peer';
-  const domId = `sigma-webrtc-audio-${elementKey}`;
+  // Kumpulkan semua audio track aktif untuk clientId ini dan buat MediaStream baru
+  // agar Chromium / Samsung Internet langsung me-refresh decoder <audio>.srcObject
+  const previousStream = clientCompositeStreams.get(clientId);
+  const trackMap = new Map<string, MediaStreamTrack>();
 
+  if (previousStream) {
+    previousStream.getAudioTracks().forEach((t) => {
+      if (t.readyState !== 'ended') {
+        t.enabled = true;
+        trackMap.set(t.id, t);
+      }
+    });
+  }
+  if (rawIncomingStream) {
+    rawIncomingStream.getAudioTracks().forEach((t) => {
+      t.enabled = true;
+      trackMap.set(t.id, t);
+    });
+  }
+  if (event.track && event.track.kind === 'audio') {
+    event.track.enabled = true;
+    trackMap.set(event.track.id, event.track);
+  }
+
+  const activeStream = new MediaStream(Array.from(trackMap.values()));
+  clientCompositeStreams.set(clientId, activeStream);
+
+  // Cari atau buat elemen <audio autoplay playsinline> yang BARU dan UNIK khusus untuk clientId ini
   let audioEl =
-    injectedAudioRegistry.get(elementKey) ||
+    injectedAudioRegistry.get(clientId) ||
     (document.getElementById(domId) as HTMLAudioElement | null);
 
   if (!audioEl) {
     audioEl = document.createElement('audio');
     audioEl.id = domId;
+    audioEl.dataset.clientId = clientId;
 
     // Pasang atribut autoplay dan playsinline secara eksplisit (TANPA atribut muted)
     audioEl.autoplay = true;
@@ -307,28 +338,34 @@ export function handleIncomingAudio(
     audioEl.style.pointerEvents = 'none';
     audioEl.style.zIndex = '-1';
 
-    const targetContainer = options.container || document.body;
+    const targetContainer =
+      options.container ||
+      document.getElementById('master-multi-audio-stage') ||
+      document.body;
     targetContainer.appendChild(audioEl);
-    injectedAudioRegistry.set(elementKey, audioEl);
+    injectedAudioRegistry.set(clientId, audioEl);
   } else {
-    // Pastikan tidak termute jika elemen sudah ada
     audioEl.muted = false;
     audioEl.removeAttribute('muted');
     audioEl.volume = 1.0;
   }
 
-  // Pasang stream ke srcObject
-  if (audioEl.srcObject !== incomingStream) {
-    audioEl.srcObject = incomingStream;
+  // Pasang stream unik milik Klien tersebut ke srcObject
+  if (audioEl.srcObject !== activeStream) {
+    audioEl.srcObject = activeStream;
   }
 
-  options.onStreamAttached?.(incomingStream, audioEl);
+  options.onStreamAttached?.(activeStream, audioEl);
 
   // Jika track sempat muted di level jaringan lalu unmute saat paket RTP pertama tiba (umum di Samsung 5G)
-  incomingStream.getAudioTracks().forEach((track) => {
+  activeStream.getAudioTracks().forEach((track) => {
     track.onunmute = () => {
       if (audioEl) {
         audioEl.muted = false;
+        if (audioEl.srcObject !== activeStream) {
+          audioEl.srcObject = activeStream;
+        }
+        options.onStreamAttached?.(activeStream, audioEl);
         unlockAudioAutoplay(audioEl, {
           onUnlocked: options.onAutoplaySuccess,
           onBlocked: options.onAutoplayBlocked,
@@ -495,6 +532,7 @@ function hideTapToUnmuteFallback(): void {
  * Membersihkan elemen <audio> yang diinjeksikan ketika Node terputus.
  */
 export function removeInjectedAudioElement(audioId: string): void {
+  clientCompositeStreams.delete(audioId);
   const el = injectedAudioRegistry.get(audioId);
   if (el) {
     try {
