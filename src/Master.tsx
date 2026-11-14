@@ -147,7 +147,6 @@ const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
   ],
 };
 
@@ -285,6 +284,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
   const nativeDataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
   const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  const remoteDescReadyRef = useRef<Map<string, boolean>>(new Map());
   const [clientStreams, setClientStreams] = useState<ClientStreamEntry[]>([]);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -1191,7 +1191,11 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             const pc = new RTCPeerConnection(RTC_CONFIG);
             // Simpan di dalam `peerConnections.current` (Map di dalam useRef)
             pcMap.set(senderId, pc);
-            candQueueMap.set(senderId, []);
+            // Tandai bahwa remoteDescription belum selesai diset (cegah race condition ICE Candidate)
+            remoteDescReadyRef.current.set(senderId, false);
+            if (!candQueueMap.has(senderId)) {
+              candQueueMap.set(senderId, []);
+            }
 
             handlersRef.current.upsertConnectedClient(senderId, {
               lastTelemetryAt: Date.now(),
@@ -1274,6 +1278,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                 pcMap.delete(senderId);
                 dcMap.delete(senderId);
                 candQueueMap.delete(senderId);
+                remoteDescReadyRef.current.delete(senderId);
                 handlersRef.current.removeDisconnectedClient(senderId);
               }
             };
@@ -1282,15 +1287,25 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               await pc.setRemoteDescription(
                 new RTCSessionDescription(offerPayload)
               );
+              // Setelah setRemoteDescription() selesai dieksekusi (resolved promise),
+              // tandai siap dan masukkan semua candidate yang sempat tertahan di antrean
+              remoteDescReadyRef.current.set(senderId, true);
 
-              // Pasang ICE candidate milik `senderId` yang sempat mengantre
-              const queued = candQueueMap.get(senderId) || [];
-              while (queued.length > 0) {
-                const nextCand = queued.shift();
+              const candidateQueue = candQueueMap.get(senderId) || [];
+              while (candidateQueue.length > 0) {
+                const nextCand = candidateQueue.shift();
                 if (nextCand) {
+                  console.log(
+                    `[MASTER-WS] Memasukkan ICE Candidate dari antrean untuk "${senderId}"`
+                  );
                   await pc
                     .addIceCandidate(new RTCIceCandidate(nextCand))
-                    .catch(() => {});
+                    .catch((err) => {
+                      console.error(
+                        `[MASTER-WS] Gagal addIceCandidate dari antrean untuk "${senderId}":`,
+                        err
+                      );
+                    });
                 }
               }
 
@@ -1321,7 +1336,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             return;
           }
 
-          // D. Terima ICE Candidate dari `senderId` dan tambahkan HANYA ke `pcMap.get(senderId)`
+          // D. ICE CANDIDATE QUEUEING (PENCEGAH RACE CONDITION):
+          // Saat menerima pesan { type: "candidate" } dari WebSocket, JANGAN langsung memanggil
+          // peerConnection.addIceCandidate() sebelum remoteDescription siap.
           const candidatePayload = (data.data || data.candidate) as
             | RTCIceCandidateInit
             | undefined;
@@ -1330,9 +1347,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             candidatePayload
           ) {
             const pc = pcMap.get(senderId);
-            if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+            const isRemoteReady =
+              Boolean(pc && pc.remoteDescription && pc.remoteDescription.type) &&
+              remoteDescReadyRef.current.get(senderId) === true;
+
+            if (pc && isRemoteReady) {
               console.log(
-                `[MASTER-WS] Menambahkan ICE Candidate ke peerConnections.get("${senderId}")`
+                `[MASTER-WS] Menambahkan ICE Candidate langsung ke peerConnections.get("${senderId}")`
               );
               await pc
                 .addIceCandidate(new RTCIceCandidate(candidatePayload))
@@ -1344,11 +1365,11 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                 });
             } else {
               console.log(
-                `[MASTER-WS] Mengantrekan ICE Candidate untuk "${senderId}" (RemoteDescription belum siap)`
+                `[MASTER-WS] Mengantrekan ICE Candidate untuk "${senderId}" ke candidateQueue (remoteDescription belum siap)`
               );
-              const list = candQueueMap.get(senderId) || [];
-              list.push(candidatePayload);
-              candQueueMap.set(senderId, list);
+              const candidateQueue = candQueueMap.get(senderId) || [];
+              candidateQueue.push(candidatePayload);
+              candQueueMap.set(senderId, candidateQueue);
             }
           }
         };

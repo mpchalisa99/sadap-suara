@@ -81,7 +81,6 @@ const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
   ],
 };
 
@@ -152,6 +151,7 @@ export const Client: React.FC<ClientProps> = ({
   const nativePcRef = useRef<RTCPeerConnection | null>(null);
   const nativeDcRef = useRef<RTCDataChannel | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const isRemoteDescReadyRef = useRef<boolean>(false);
   const isHandshakingRef = useRef<boolean>(false);
   const isConnectedRef = useRef<boolean>(false);
 
@@ -329,7 +329,21 @@ export const Client: React.FC<ClientProps> = ({
     };
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia(rawConstraints);
+      let stream: MediaStream;
+      try {
+        // Coba gunakan constraint audio taktis spesifik terlebih dahulu
+        stream = await navigator.mediaDevices.getUserMedia(rawConstraints);
+      } catch (constraintErr) {
+        // FALLBACK AUDIO CONSTRAINTS (KHUSUS SAMSUNG):
+        // Jika browser/hardware Samsung menolak constraint spesifik di atas,
+        // langsung fallback ke { audio: true } murni agar getUserMedia tidak gagal.
+        console.warn(
+          '[CLIENT-AUDIO] Constraint spesifik ditolak perangkat, menggunakan fallback { audio: true }:',
+          constraintErr
+        );
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+
       stream.getTracks().forEach((track) => {
         track.enabled = !remoteAudioStateRef.current.muted;
       });
@@ -442,15 +456,7 @@ export const Client: React.FC<ClientProps> = ({
       const peerConnection = new RTCPeerConnection(RTC_CONFIG);
       nativePcRef.current = peerConnection;
       pendingCandidatesRef.current = [];
-
-      // =========================================================================
-      // 1. FORCE AUDIO TRANSCEIVER DI KLIEN (SAMSUNG GALAXY A26 5G FIX)
-      // Paksa pembuatan jalur m-line audio dengan direction: 'sendonly'
-      // tepat saat RTCPeerConnection dibuat (bahkan sebelum mikrofon aktif).
-      // =========================================================================
-      const forcedAudioTransceiver = peerConnection.addTransceiver('audio', {
-        direction: 'sendonly',
-      });
+      isRemoteDescReadyRef.current = false;
 
       // Buat RTCDataChannel untuk pengiriman koordinat GPS & penerimaan komando Master
       const dc = peerConnection.createDataChannel('sigma-telemetry', { ordered: true });
@@ -484,36 +490,25 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       };
 
-      // =========================================================================
-      // 2. URUTAN ADD TRACK YANG BENAR (KLIEN) SEBELUM MEMANGGIL createOffer()
-      // Ambil stream dari navigator.mediaDevices.getUserMedia dan masukkan
-      // menggunakan stream.getTracks().forEach(track => peerConnection.addTrack(track, stream))
-      // SEBELUM memanggil createOffer().
-      // =========================================================================
+      // Ambil stream mikrofon (dengan fallback { audio: true } untuk Samsung)
+      // dan tambahkan ke PeerConnection SEBELUM memanggil createOffer()
       const stream = (await ensureMicrophoneStream()) || rawStreamRef.current;
-      if (stream) {
+      let addedAudioTrack = false;
+      if (stream && stream.getTracks().length > 0) {
         stream.getTracks().forEach((track) => {
           track.enabled = !remoteAudioStateRef.current.muted;
-          const alreadyAdded = peerConnection
-            .getSenders()
-            .some((s) => s.track && s.track.id === track.id);
-          if (!alreadyAdded) {
-            peerConnection.addTrack(track, stream);
+          peerConnection.addTrack(track, stream);
+          if (track.kind === 'audio') {
+            addedAudioTrack = true;
           }
         });
+      }
 
-        // Pastikan transceiver 'sendonly' pertama juga terikat ke track mikrofon Samsung
-        const firstAudioTrack = stream.getAudioTracks()[0];
-        if (
-          firstAudioTrack &&
-          forcedAudioTransceiver &&
-          forcedAudioTransceiver.sender &&
-          !forcedAudioTransceiver.sender.track
-        ) {
-          await forcedAudioTransceiver.sender
-            .replaceTrack(firstAudioTrack)
-            .catch(() => {});
-        }
+      // Jika mikrofon belum aktif/tersedia, tetap pastikan ada jalur m-line audio
+      if (!addedAudioTrack) {
+        peerConnection.addTransceiver('audio', {
+          direction: 'sendonly',
+        });
       }
 
       // Pastikan seluruh transceiver audio berarah 'sendonly' agar SDP konsisten di Samsung
@@ -710,17 +705,29 @@ export const Client: React.FC<ClientProps> = ({
                 await pc.setRemoteDescription(
                   new RTCSessionDescription(sdpPayload)
                 );
+                // Tandai bahwa setRemoteDescription() telah selesai (resolved promise)
+                isRemoteDescReadyRef.current = true;
                 isConnectedRef.current = true;
                 setPeerStatus('CONNECTED');
                 console.log('[CLIENT-WS] setRemoteDescription(answer) BERHASIL!');
 
-                // Pasang semua ICE candidate yang sempat mengantre
-                while (pendingCandidatesRef.current.length > 0) {
-                  const cand = pendingCandidatesRef.current.shift();
+                // Setelah setRemoteDescription() selesai dieksekusi, masukkan semua candidate
+                // yang sempat tertahan di antrean (candidateQueue / pendingCandidatesRef)
+                const candidateQueue = pendingCandidatesRef.current;
+                while (candidateQueue.length > 0) {
+                  const cand = candidateQueue.shift();
                   if (cand) {
+                    console.log(
+                      '[CLIENT-WS] Memasukkan ICE Candidate dari antrean (candidateQueue)'
+                    );
                     await pc
                       .addIceCandidate(new RTCIceCandidate(cand))
-                      .catch(() => {});
+                      .catch((err) => {
+                        console.error(
+                          '[CLIENT-WS] Gagal addIceCandidate dari antrean:',
+                          err
+                        );
+                      });
                   }
                 }
                 transmitTelemetryPacket();
@@ -731,8 +738,9 @@ export const Client: React.FC<ClientProps> = ({
             return;
           }
 
-          // Terima ICE Candidate spesifik dari Master:
-          // { type: "candidate", senderId: "MASTER", targetId: myClientId, data: candidate }
+          // 1. ICE CANDIDATE QUEUEING (PENCEGAH RACE CONDITION):
+          // Saat menerima pesan { type: "candidate" } dari WebSocket, JANGAN langsung memanggil
+          // peerConnection.addIceCandidate() sebelum remoteDescription siap.
           const candidatePayload = (data.data || data.candidate) as
             | RTCIceCandidateInit
             | undefined;
@@ -743,11 +751,17 @@ export const Client: React.FC<ClientProps> = ({
           ) {
             try {
               const pc = nativePcRef.current;
-              if (pc.remoteDescription && pc.remoteDescription.type) {
-                console.log('[CLIENT-WS] Menambahkan ICE Candidate dari MASTER');
+              if (
+                pc.remoteDescription &&
+                pc.remoteDescription.type &&
+                isRemoteDescReadyRef.current
+              ) {
+                console.log('[CLIENT-WS] Menambahkan ICE Candidate langsung dari MASTER');
                 await pc.addIceCandidate(new RTCIceCandidate(candidatePayload));
               } else {
-                console.log('[CLIENT-WS] Mengantrekan ICE Candidate dari MASTER');
+                console.log(
+                  '[CLIENT-WS] Mengantrekan ICE Candidate dari MASTER ke candidateQueue (remoteDescription belum siap)'
+                );
                 pendingCandidatesRef.current.push(candidatePayload);
               }
             } catch (err) {

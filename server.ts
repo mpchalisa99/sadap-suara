@@ -46,31 +46,49 @@ async function startServer() {
   };
 
   const wss = new WebSocketServer({ noServer: true });
+  const hmrWss = new WebSocketServer({
+    noServer: true,
+    handleProtocols: (protocols) => {
+      if (protocols.has('vite-hmr')) return 'vite-hmr';
+      if (protocols.has('vite-ping')) return 'vite-ping';
+      const first = protocols.values().next().value;
+      return first || false;
+    },
+  });
 
   server.on('upgrade', (request, socket, head) => {
-    const protocolHeader = request.headers['sec-websocket-protocol'] || '';
+    socket.on('error', () => {});
+    const protocolHeader = String(
+      request.headers['sec-websocket-protocol'] || ''
+    );
     const reqUrl = request.url || '/';
 
-    if (protocolHeader.includes('vite-hmr')) {
-      wss.handleUpgrade(request, socket, head, (ws) => {
+    if (
+      protocolHeader.includes('vite-hmr') ||
+      protocolHeader.includes('vite-ping') ||
+      reqUrl.includes('token=') ||
+      reqUrl.includes('__vite')
+    ) {
+      hmrWss.handleUpgrade(request, socket, head, (ws) => {
+        ws.on('error', () => {});
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'connected' }));
         }
+        ws.on('message', (msg) => {
+          try {
+            const parsed = JSON.parse(msg.toString());
+            if (parsed?.type === 'ping' && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'pong' }));
+            }
+          } catch {}
+        });
       });
       return;
     }
 
-    if (
-      reqUrl.startsWith('/ws') ||
-      reqUrl.startsWith('/signaling') ||
-      reqUrl === '/'
-    ) {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-      });
-    } else {
-      socket.destroy();
-    }
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
   });
 
   wss.on('connection', (ws: WebSocket) => {
