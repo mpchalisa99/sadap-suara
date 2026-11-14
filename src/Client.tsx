@@ -528,26 +528,6 @@ export const Client: React.FC<ClientProps> = ({
         }
       });
 
-      // Pasang SDP Renegotiation Handler jika track mikrofon menyusul belakangan
-      setupNegotiation(peerConnection, {
-        nodeId,
-        sendSignal: (envelope: SignalingEnvelope) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            const isOffer = envelope.type === 'SIGMA_SDP_RENEGOTIATE_OFFER';
-            const renegotiatePacket = {
-              type: isOffer ? 'offer' : 'candidate',
-              senderId: nodeId,
-              targetId: 'MASTER',
-              data: isOffer ? envelope.sdp : envelope.candidate,
-            };
-            console.log(
-              `[CLIENT-WS] Mengirim sinyal renegotiation (${renegotiatePacket.type}) dari "${nodeId}" ke "MASTER"`
-            );
-            ws.send(JSON.stringify(renegotiatePacket));
-          }
-        },
-      });
-
       // Kirim ICE Candidate otomatis dengan format:
       // { type: "candidate", senderId: myClientId, targetId: "MASTER", data: candidate }
       peerConnection.onicecandidate = (event) => {

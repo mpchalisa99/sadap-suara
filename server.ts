@@ -34,6 +34,7 @@ async function startServer() {
   // 1. REGISTRASI & ROUTING WEBSOCKET SINKRON (`clients = new Map<string, ws>()`)
   // ============================================================================
   const clients = new Map<string, WebSocket>();
+  const masterSockets = new Set<WebSocket>();
   const socketToId = new Map<WebSocket, string>();
   const httpMailboxes = new Map<string, SignalingPayload[]>();
 
@@ -120,6 +121,9 @@ async function startServer() {
 
         clients.set(normalizedId, ws);
         socketToId.set(ws, normalizedId);
+        if (normalizedId === 'MASTER') {
+          masterSockets.add(ws);
+        }
 
         console.log(
           `[SERVER-WS] REGISTERED: id="${normalizedId}" | Total Peer Aktif: ${
@@ -210,6 +214,9 @@ async function startServer() {
         if (!clients.has(senderKey)) {
           clients.set(senderKey, ws);
           socketToId.set(ws, senderKey);
+          if (senderKey === 'MASTER') {
+            masterSockets.add(ws);
+          }
           console.log(
             `[SERVER-WS] Auto-registered senderId="${senderKey}" ke dalam Map.`
           );
@@ -264,10 +271,25 @@ async function startServer() {
     });
 
     ws.on('close', () => {
+      masterSockets.delete(ws);
       const closedId = socketToId.get(ws);
       socketToId.delete(ws);
 
       if (closedId && clients.get(closedId) === ws) {
+        if (closedId === 'MASTER' && masterSockets.size > 0) {
+          // Promosikan socket MASTER lain yang masih aktif jika ada
+          const nextMasterWs = Array.from(masterSockets).find(
+            (s) => s.readyState === WebSocket.OPEN
+          );
+          if (nextMasterWs) {
+            clients.set('MASTER', nextMasterWs);
+            console.log(
+              '[SERVER-WS] Socket MASTER sekunder ditutup; socket MASTER aktif lainnya tetap dipertahankan.'
+            );
+            return;
+          }
+        }
+
         clients.delete(closedId);
         console.log(
           `[SERVER-WS] DISCONNECTED: id="${closedId}" dihapus dari Map. Sisa peer: [${Array.from(

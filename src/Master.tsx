@@ -1391,59 +1391,62 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
   // Initialize Master PeerJS Broker (Fallback layer dengan ID tetap `sigma-master-main`)
   useEffect(() => {
+    const bindPeerListeners = (peerInstance: Peer) => {
+      peerInstance.on('open', (id) => {
+        setMasterPeerId(id);
+      });
+
+      peerInstance.on('call', (incomingCall) => {
+        const metaNodeId =
+          incomingCall.metadata?.nodeId ||
+          incomingCall.peer.replace('sigma-node-', '');
+
+        if (metaNodeId) {
+          const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
+          if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
+
+          registerMediaConnection(metaNodeId, incomingCall);
+          incomingCall.answer();
+          if (incomingCall.peerConnection) {
+            incomingCall.peerConnection.ontrack = (event: RTCTrackEvent) => {
+              handleIncomingAudio(event, {
+                audioId: metaNodeId,
+                onStreamAttached: (inboundStream) => {
+                  attachWebRTCStreamToNode(metaNodeId, inboundStream);
+                  setConnectionBanner(
+                    `LIVE WEBRTC AUDIO TRACK ACTIVE: NODE (${metaNodeId})`
+                  );
+                },
+                onAutoplaySuccess: () => setAutoplayBlocked(false),
+                onAutoplayBlocked: () => setAutoplayBlocked(true),
+              });
+            };
+          }
+        }
+      });
+
+      peerInstance.on('connection', (conn) => {
+        const metaNodeId =
+          conn.metadata?.nodeId || conn.peer.replace('sigma-node-', '');
+        if (metaNodeId) {
+          const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
+          if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
+          registerDataConnection(metaNodeId, conn);
+        }
+      });
+    };
+
     const primaryMasterId = 'sigma-master-main';
     const peer = new Peer(primaryMasterId, { debug: 0 });
     peerRef.current = peer;
-
-    peer.on('open', (id) => {
-      setMasterPeerId(id);
-    });
+    bindPeerListeners(peer);
 
     peer.on('error', (err: { type?: string }) => {
       if (err?.type === 'unavailable-id') {
         const backupId = `sigma-master-${Math.floor(1000 + Math.random() * 9000)}`;
         const backupPeer = new Peer(backupId, { debug: 0 });
         peerRef.current = backupPeer;
-        backupPeer.on('open', (id) => setMasterPeerId(id));
-      }
-    });
-
-    peer.on('call', (incomingCall) => {
-      const metaNodeId =
-        incomingCall.metadata?.nodeId ||
-        incomingCall.peer.replace('sigma-node-', '');
-
-      if (metaNodeId) {
-        const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
-        if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
-
-        registerMediaConnection(metaNodeId, incomingCall);
-        incomingCall.answer();
-        if (incomingCall.peerConnection) {
-          incomingCall.peerConnection.ontrack = (event: RTCTrackEvent) => {
-            handleIncomingAudio(event, {
-              audioId: metaNodeId,
-              onStreamAttached: (inboundStream) => {
-                attachWebRTCStreamToNode(metaNodeId, inboundStream);
-                setConnectionBanner(
-                  `LIVE WEBRTC AUDIO TRACK ACTIVE: NODE (${metaNodeId})`
-                );
-              },
-              onAutoplaySuccess: () => setAutoplayBlocked(false),
-              onAutoplayBlocked: () => setAutoplayBlocked(true),
-            });
-          };
-        }
-      }
-    });
-
-    peer.on('connection', (conn) => {
-      const metaNodeId =
-        conn.metadata?.nodeId || conn.peer.replace('sigma-node-', '');
-      if (metaNodeId) {
-        const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
-        if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
-        registerDataConnection(metaNodeId, conn);
+        bindPeerListeners(backupPeer);
       }
     });
 
