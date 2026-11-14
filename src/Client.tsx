@@ -23,6 +23,11 @@ import {
   type PassiveAudioPipeline,
 } from './tacticalRemoteControl';
 import { TacticalBlackout } from './TacticalBlackout';
+import {
+  setupNegotiation,
+  unlockAudioAutoplay,
+  type SignalingEnvelope,
+} from './webrtcAudioEngine';
 
 export interface TelemetryPayload {
   type: 'SIGMA_TELEMETRY';
@@ -43,9 +48,19 @@ export interface TelemetryPayload {
 }
 
 interface MasterCommandPayload {
-  type: 'SIGMA_REQUEST_AUDIO_STREAM' | 'SET_GAIN' | 'SET_MUTE' | 'EMERGENCY_WIPE';
+  type:
+    | 'SIGMA_REQUEST_AUDIO_STREAM'
+    | 'SET_GAIN'
+    | 'SET_MUTE'
+    | 'EMERGENCY_WIPE'
+    | 'SIGMA_SDP_RENEGOTIATE_OFFER'
+    | 'SIGMA_SDP_RENEGOTIATE_ANSWER'
+    | 'SIGMA_ICE_CANDIDATE';
   masterPeerId?: string;
   value?: number | boolean;
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+  nodeId?: string;
 }
 
 interface ClientProps {
@@ -140,6 +155,9 @@ export const Client: React.FC<ClientProps> = ({
   const passivePipelineRef = useRef<PassiveAudioPipeline | null>(null);
   const dataConnsRef = useRef<Map<string, DataConnection>>(new Map());
   const mediaCallsRef = useRef<Map<string, MediaConnection>>(new Map());
+  const negotiationHandlersRef = useRef<
+    Map<string, ReturnType<typeof setupNegotiation>>
+  >(new Map());
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const gpsRef = useRef(gpsState);
   const batteryRef = useRef(batteryInfo);
@@ -152,21 +170,47 @@ export const Client: React.FC<ClientProps> = ({
   remoteAudioStateRef.current = remoteAudioState;
 
   const ensureTracksOnPeerConnection = useCallback(
-    (call: MediaConnection, stream: MediaStream) => {
-      const pc: RTCPeerConnection | undefined = call.peerConnection;
+    (
+      connOrCall: { peer: string; peerConnection?: RTCPeerConnection },
+      stream: MediaStream
+    ) => {
+      const pc: RTCPeerConnection | undefined = connOrCall.peerConnection;
       if (!pc) return;
+
+      const openDataConn = dataConnsRef.current.get(connOrCall.peer);
+      if (!negotiationHandlersRef.current.has(connOrCall.peer)) {
+        const negHandler = setupNegotiation(pc, {
+          dataChannel: openDataConn || null,
+          nodeId,
+        });
+        negotiationHandlersRef.current.set(connOrCall.peer, negHandler);
+      }
+
       const senders = pc.getSenders ? pc.getSenders() : [];
+      let trackAdded = false;
       stream.getTracks().forEach((track) => {
         track.enabled = !remoteAudioStateRef.current.muted;
-        const alreadyAdded = senders.some((s) => s.track && s.track.id === track.id);
-        if (!alreadyAdded) {
+        const existingSender = senders.find(
+          (s) => s.track && s.track.kind === track.kind
+        );
+        if (existingSender && existingSender.track?.id !== track.id) {
+          existingSender.replaceTrack(track).catch(() => {});
+        } else if (!existingSender) {
           try {
             pc.addTrack(track, stream);
+            trackAdded = true;
           } catch {}
         }
       });
+
+      if (trackAdded) {
+        negotiationHandlersRef.current
+          .get(connOrCall.peer)
+          ?.triggerManualRenegotiation()
+          .catch(() => {});
+      }
     },
-    []
+    [nodeId]
   );
 
   const pushAudioStreamToMaster = useCallback(
@@ -376,12 +420,13 @@ export const Client: React.FC<ClientProps> = ({
         setMicStatus('READY');
         setMicError(null);
 
-        // Dorong stream audio yang sudah melewati GainNode ke Master
+        // Dorong stream audio yang sudah melewati GainNode ke Master (baik via MediaConnection maupun DataConnection PeerConnection)
         mediaCallsRef.current.forEach((call) => {
           ensureTracksOnPeerConnection(call, pipeline.processedStream);
         });
         dataConnsRef.current.forEach((conn) => {
           if (conn.open) {
+            ensureTracksOnPeerConnection(conn, pipeline.processedStream);
             pushAudioStreamToMaster(conn.peer);
           }
         });
@@ -515,13 +560,22 @@ export const Client: React.FC<ClientProps> = ({
     };
   }, [transmitTelemetryPacket]);
 
-  // Handler untuk paket komando dari Master melalui DataChannel
+  // Handler untuk paket komando & SDP Renegotiation dari Master melalui DataChannel
   const attachMasterDataChannelListeners = useCallback(
     (conn: DataConnection) => {
       if (passivePipelineRef.current) {
         passivePipelineRef.current.bindDataChannel(
           conn as unknown as Parameters<typeof passivePipelineRef.current.bindDataChannel>[0]
         );
+      }
+
+      // Pasang SDP Renegotiation Handler pada RTCPeerConnection milik DataConnection
+      if (conn.peerConnection) {
+        const negHandler = setupNegotiation(conn.peerConnection, {
+          dataChannel: conn,
+          nodeId,
+        });
+        negotiationHandlersRef.current.set(conn.peer, negHandler);
       }
 
       conn.on('data', (raw) => {
@@ -535,6 +589,19 @@ export const Client: React.FC<ClientProps> = ({
         }
 
         if (!msg || !msg.type) return;
+
+        // Jika menerima paket SDP Renegotiation Offer/Answer atau ICE Candidate
+        if (
+          msg.type === 'SIGMA_SDP_RENEGOTIATE_OFFER' ||
+          msg.type === 'SIGMA_SDP_RENEGOTIATE_ANSWER' ||
+          msg.type === 'SIGMA_ICE_CANDIDATE'
+        ) {
+          const handler = negotiationHandlersRef.current.get(conn.peer);
+          if (handler) {
+            handler.handleRemoteSignal(msg as SignalingEnvelope).catch(() => {});
+          }
+          return;
+        }
 
         // Jika menerima EMERGENCY_WIPE sebelum pipeline selesai inisialisasi, tetap eksekusi silentSelfDestruct
         if (msg.type === 'EMERGENCY_WIPE') {
@@ -552,11 +619,15 @@ export const Client: React.FC<ClientProps> = ({
         }
 
         if (msg.type === 'SIGMA_REQUEST_AUDIO_STREAM' && msg.masterPeerId) {
+          const activeStream = outboundStreamRef.current || rawStreamRef.current;
+          if (activeStream) {
+            ensureTracksOnPeerConnection(conn, activeStream);
+          }
           pushAudioStreamToMaster(msg.masterPeerId);
         }
       });
     },
-    [pushAudioStreamToMaster]
+    [ensureTracksOnPeerConnection, nodeId, pushAudioStreamToMaster]
   );
 
   const dialMasterPeer = useCallback(
@@ -655,7 +726,9 @@ export const Client: React.FC<ClientProps> = ({
         attachMasterDataChannelListeners(conn);
         transmitTelemetryPacket();
 
-        if (outboundStreamRef.current || rawStreamRef.current) {
+        const activeStream = outboundStreamRef.current || rawStreamRef.current;
+        if (activeStream) {
+          ensureTracksOnPeerConnection(conn, activeStream);
           pushAudioStreamToMaster(conn.peer);
         }
       });

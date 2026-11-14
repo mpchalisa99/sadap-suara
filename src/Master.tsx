@@ -30,6 +30,13 @@ import { PWAInstallButton } from './PWAInstallButton';
 import { BarcodeModal } from './BarcodeModal';
 import type { TelemetryPayload } from './Client';
 import { sendCommand, triggerEmergencyWipe } from './tacticalRemoteControl';
+import {
+  setupNegotiation,
+  handleIncomingAudio,
+  unlockAudioAutoplay,
+  removeInjectedAudioElement,
+  type SignalingEnvelope,
+} from './webrtcAudioEngine';
 
 export type AutoRecordMode = 'OFF' | 'IMMEDIATE' | 'VOX';
 
@@ -203,6 +210,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   const pipelinesRef = useRef<Map<string, AudioPipelineEntry>>(new Map());
   const dataConnsRef = useRef<Map<string, DataConnection>>(new Map());
   const mediaCallsRef = useRef<Map<string, MediaConnection>>(new Map());
+  const negotiationHandlersRef = useRef<
+    Map<string, ReturnType<typeof setupNegotiation>>
+  >(new Map());
   const canvasesRef = useRef<Map<string, HTMLCanvasElement | null>>(new Map());
   // Dedicated HTML <audio autoPlay playsInline> elements per connected Client Node
   const nodeAudioElsRef = useRef<Map<string, HTMLAudioElement | null>>(new Map());
@@ -297,6 +307,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     if (ctx.state === 'suspended') {
       ctx.resume().catch(() => {});
     }
+
+    // Panggil modul Autoplay Unlocker untuk semua elemen <audio> yang diinjeksikan
+    unlockAudioAutoplay(undefined, {
+      audioContext: ctx,
+      onUnlocked: () => setAutoplayBlocked(false),
+      onBlocked: () => setAutoplayBlocked(true),
+    });
 
     let anyBlocked = false;
     nodeAudioElsRef.current.forEach((audioEl, nodeId) => {
@@ -530,6 +547,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       audioEl.srcObject = null;
       nodeAudioElsRef.current.delete(nodeId);
     }
+    removeInjectedAudioElement(nodeId);
+    negotiationHandlersRef.current.get(nodeId)?.cleanup();
+    negotiationHandlersRef.current.delete(nodeId);
 
     const entry = pipelinesRef.current.get(nodeId);
     if (entry) {
@@ -640,25 +660,19 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         lastTelemetryAt: Date.now(),
       });
 
-      // Langsung sambungkan ke elemen <audio autoPlay playsInline> menggunakan srcObject
-      setTimeout(() => {
-        const audioEl = nodeAudioElsRef.current.get(nodeId);
-        if (audioEl) {
-          audioEl.srcObject = remoteStream;
-          audioEl.muted = !isSoloAllowed;
-          audioEl.volume = 1.0;
-          const playPromise = audioEl.play();
-          if (playPromise !== undefined) {
-            playPromise
-              .then(() => {
-                setAutoplayBlocked(false);
-              })
-              .catch(() => {
-                setAutoplayBlocked(true);
-              });
-          }
+      // Injeksi & putar elemen <audio autoplay playsinline> dinamis melalui modul handleIncomingAudio
+      const injectedEl = handleIncomingAudio(
+        { streams: [remoteStream] },
+        {
+          audioId: nodeId,
+          onAutoplaySuccess: () => setAutoplayBlocked(false),
+          onAutoplayBlocked: () => setAutoplayBlocked(true),
         }
-      }, 50);
+      );
+      if (injectedEl) {
+        injectedEl.muted = !isSoloAllowed;
+        nodeAudioElsRef.current.set(nodeId, injectedEl);
+      }
 
       if (autoRecordModeRef.current === 'IMMEDIATE') {
         setTimeout(() => {
@@ -697,7 +711,37 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     (nodeId: string, conn: DataConnection) => {
       dataConnsRef.current.set(nodeId, conn);
 
+      const bindDataPcHandlers = () => {
+        if (!conn.peerConnection) return;
+
+        // 1. Pasang setupNegotiation pada RTCPeerConnection milik DataChannel
+        const negHandler = setupNegotiation(conn.peerConnection, {
+          dataChannel: conn,
+          nodeId,
+        });
+        negotiationHandlersRef.current.set(nodeId, negHandler);
+
+        // 2. Pasang handleIncomingAudio pada peerConnection.ontrack milik DataChannel
+        // (Solusi Samsung Galaxy A26 5G ketika track audio dikirim melalui koneksi DataChannel yang sudah stabil)
+        conn.peerConnection.ontrack = (event: RTCTrackEvent) => {
+          handleIncomingAudio(event, {
+            audioId: nodeId,
+            onStreamAttached: (inboundStream) => {
+              attachWebRTCStreamToNode(nodeId, inboundStream);
+              setConnectionBanner(
+                `LIVE WEBRTC AUDIO TRACK ACTIVE (RENEGOTIATED): NODE (${nodeId})`
+              );
+            },
+            onAutoplaySuccess: () => setAutoplayBlocked(false),
+            onAutoplayBlocked: () => setAutoplayBlocked(true),
+          });
+        };
+      };
+
+      bindDataPcHandlers();
+
       conn.on('open', () => {
+        bindDataPcHandlers();
         upsertConnectedClient(nodeId, { lastTelemetryAt: Date.now() });
         setConnectionBanner(`RTCPeerConnection CONNECTED: NODE (${nodeId})`);
 
@@ -713,6 +757,29 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       });
 
       conn.on('data', (data) => {
+        let parsed: Record<string, unknown> | null = null;
+        if (typeof data === 'string') {
+          try {
+            parsed = JSON.parse(data) as Record<string, unknown>;
+          } catch {}
+        } else if (data && typeof data === 'object') {
+          parsed = data as Record<string, unknown>;
+        }
+
+        if (
+          parsed &&
+          (parsed.type === 'SIGMA_SDP_RENEGOTIATE_OFFER' ||
+            parsed.type === 'SIGMA_SDP_RENEGOTIATE_ANSWER' ||
+            parsed.type === 'SIGMA_ICE_CANDIDATE')
+        ) {
+          bindDataPcHandlers();
+          negotiationHandlersRef.current
+            .get(nodeId)
+            ?.handleRemoteSignal(parsed as unknown as SignalingEnvelope)
+            .catch(() => {});
+          return;
+        }
+
         handleIncomingTelemetry(data as TelemetryPayload);
       });
 
@@ -726,28 +793,40 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         removeDisconnectedClient(nodeId);
       });
     },
-    [handleIncomingTelemetry, removeDisconnectedClient, upsertConnectedClient]
+    [
+      attachWebRTCStreamToNode,
+      handleIncomingTelemetry,
+      removeDisconnectedClient,
+      upsertConnectedClient,
+    ]
   );
 
   /**
    * PERBAIKAN PENTING 2:
-   * Pasang event listener `peerConnection.ontrack` DAN `call.on('stream')`
-   * agar MediaStream dari Client selalu tertangkap di Master.
+   * Pasang event listener `peerConnection.ontrack` (dengan `handleIncomingAudio`)
+   * DAN `call.on('stream')` serta `setupNegotiation` agar MediaStream dari Client selalu tertangkap di Master.
    */
   const registerMediaConnection = useCallback(
     (nodeId: string, call: MediaConnection) => {
       mediaCallsRef.current.set(nodeId, call);
 
-      // 1. Listener native RTCPeerConnection.ontrack
+      // 1. Listener native RTCPeerConnection.ontrack + setupNegotiation
       const bindOnTrack = (pc?: RTCPeerConnection) => {
         if (!pc) return;
+        setupNegotiation(pc, {
+          dataChannel: dataConnsRef.current.get(nodeId) || null,
+          nodeId,
+        });
         pc.ontrack = (event: RTCTrackEvent) => {
-          const inboundStream =
-            event.streams && event.streams[0]
-              ? event.streams[0]
-              : new MediaStream([event.track]);
-          attachWebRTCStreamToNode(nodeId, inboundStream);
-          setConnectionBanner(`LIVE WEBRTC AUDIO TRACK ACTIVE: NODE (${nodeId})`);
+          handleIncomingAudio(event, {
+            audioId: nodeId,
+            onStreamAttached: (inboundStream) => {
+              attachWebRTCStreamToNode(nodeId, inboundStream);
+              setConnectionBanner(`LIVE WEBRTC AUDIO TRACK ACTIVE: NODE (${nodeId})`);
+            },
+            onAutoplaySuccess: () => setAutoplayBlocked(false),
+            onAutoplayBlocked: () => setAutoplayBlocked(true),
+          });
         };
       };
 
@@ -755,8 +834,18 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
       // 2. Listener PeerJS call.on('stream')
       call.on('stream', (remoteStream) => {
-        attachWebRTCStreamToNode(nodeId, remoteStream);
-        setConnectionBanner(`LIVE WEBRTC AUDIO STREAM ACTIVE: NODE (${nodeId})`);
+        handleIncomingAudio(
+          { streams: [remoteStream] },
+          {
+            audioId: nodeId,
+            onStreamAttached: (inboundStream) => {
+              attachWebRTCStreamToNode(nodeId, inboundStream);
+              setConnectionBanner(`LIVE WEBRTC AUDIO STREAM ACTIVE: NODE (${nodeId})`);
+            },
+            onAutoplaySuccess: () => setAutoplayBlocked(false),
+            onAutoplayBlocked: () => setAutoplayBlocked(true),
+          }
+        );
       });
 
       call.on('close', () => {
@@ -843,14 +932,17 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         // Pastikan ontrack juga terikat pada peerConnection yang baru dibuat saat answer()
         if (incomingCall.peerConnection) {
           incomingCall.peerConnection.ontrack = (event: RTCTrackEvent) => {
-            const inboundStream =
-              event.streams && event.streams[0]
-                ? event.streams[0]
-                : new MediaStream([event.track]);
-            attachWebRTCStreamToNode(metaNodeId, inboundStream);
-            setConnectionBanner(
-              `LIVE WEBRTC AUDIO TRACK ACTIVE: NODE (${metaNodeId})`
-            );
+            handleIncomingAudio(event, {
+              audioId: metaNodeId,
+              onStreamAttached: (inboundStream) => {
+                attachWebRTCStreamToNode(metaNodeId, inboundStream);
+                setConnectionBanner(
+                  `LIVE WEBRTC AUDIO TRACK ACTIVE: NODE (${metaNodeId})`
+                );
+              },
+              onAutoplaySuccess: () => setAutoplayBlocked(false),
+              onAutoplayBlocked: () => setAutoplayBlocked(true),
+            });
           };
         }
       }
@@ -1460,26 +1552,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                   key={client.nodeId}
                   className="rounded border bg-[#06101e]/95 border-cyan-500/45 border-glow-cyan px-3.5 py-2.5 transition-all"
                 >
-                  {/* PERBAIKAN PENTING 3: Elemen <audio autoPlay playsInline> yang dihubungkan via srcObject */}
-                  <audio
-                    autoPlay
-                    playsInline
-                    ref={(el) => {
-                      nodeAudioElsRef.current.set(client.nodeId, el);
-                      const entry = pipelinesRef.current.get(client.nodeId);
-                      if (el && entry && el.srcObject !== entry.stream) {
-                        el.srcObject = entry.stream;
-                        const shouldPlay =
-                          !masterMuted &&
-                          (soloNodeId === null || soloNodeId === client.nodeId);
-                        el.muted = !shouldPlay;
-                        el.play().catch(() => {
-                          setAutoplayBlocked(true);
-                        });
-                      }
-                    }}
-                    className="hidden"
-                  />
+                  {/* Elemen <audio autoplay playsinline> diinjeksikan secara dinamis ke DOM oleh handleIncomingAudio() */}
 
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
