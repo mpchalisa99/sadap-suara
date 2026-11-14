@@ -37,6 +37,14 @@ import {
   removeInjectedAudioElement,
   type SignalingEnvelope,
 } from './webrtcAudioEngine';
+import {
+  peerConnections as multiPeerConnections,
+  clientDataChannels,
+  handleIncomingOffer,
+  handleIncomingIce,
+  cleanupClientConnection,
+  cleanupAllClientConnections,
+} from './WebRTCMultiManager';
 
 export type AutoRecordMode = 'OFF' | 'IMMEDIATE' | 'VOX';
 
@@ -222,10 +230,9 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const pipelinesRef = useRef<Map<string, AudioPipelineEntry>>(new Map());
-  // Dictionary utama `const peerConnections = {}` untuk menampung hingga 5 RTCPeerConnection Klien
-  const peerConnectionsRef = useRef<Record<string, RTCPeerConnection>>({});
-  const nativeDataChannelsRef = useRef<Record<string, RTCDataChannel>>({});
-  const pendingCandidatesRef = useRef<Record<string, RTCIceCandidateInit[]>>({});
+  // Dictionary utama `const peerConnections = {}` dari WebRTCMultiManager untuk menampung hingga 5 RTCPeerConnection Klien
+  const peerConnectionsRef = useRef<Record<string, RTCPeerConnection>>(multiPeerConnections);
+  const nativeDataChannelsRef = useRef<Record<string, RTCDataChannel>>(clientDataChannels);
   const wsRef = useRef<WebSocket | null>(null);
 
   const dataConnsRef = useRef<Map<string, DataConnection>>(new Map());
@@ -568,14 +575,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
     if (hasOpenData || hasOpenMedia || hasOpenNativePc) return;
 
-    if (peerConnectionsRef.current[nodeId]) {
-      try {
-        peerConnectionsRef.current[nodeId].close();
-      } catch {}
-      delete peerConnectionsRef.current[nodeId];
-    }
-    delete nativeDataChannelsRef.current[nodeId];
-    delete pendingCandidatesRef.current[nodeId];
+    cleanupClientConnection(nodeId, 'remove_disconnected_client');
 
     const audioEl = nodeAudioElsRef.current.get(nodeId);
     if (audioEl) {
@@ -1040,17 +1040,12 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
           // B. Tangani Notifikasi Putusnya Klien
           if (msg.type === 'client_disconnected' && senderId) {
-            if (peerConnections[senderId]) {
-              try {
-                peerConnections[senderId].close();
-              } catch {}
-              delete peerConnections[senderId];
-            }
+            cleanupClientConnection(senderId, 'ws_client_disconnected');
             removeDisconnectedClient(senderId);
             return;
           }
 
-          // C. PENERIMAAN OTOMATIS BERURUTAN SAAT MENERIMA `type: "offer"` DARI `senderId`
+          // C. PENERIMAAN OTOMATIS BERURUTAN SAAT MENERIMA `type: "offer"` DARI `senderId` (WebRTCMultiManager)
           if (msg.type === 'offer' && senderId && msg.sdp) {
             const isExistingClient =
               Boolean(peerConnections[senderId]) ||
@@ -1061,23 +1056,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               return;
             }
 
-            // Tutup koneksi lama milik senderId yang sama jika ia sedang melakukan Auto-Reconnect
-            if (peerConnections[senderId]) {
-              try {
-                peerConnections[senderId].onicecandidate = null;
-                peerConnections[senderId].ontrack = null;
-                peerConnections[senderId].onconnectionstatechange = null;
-                peerConnections[senderId].close();
-              } catch {}
-            }
-
-            // a. Buat instans RTCPeerConnection baru untuk senderId tersebut
-            const pc = new RTCPeerConnection(RTC_CONFIG);
-
-            // b. Masukkan instans ke dalam `peerConnections[senderId]`
-            peerConnections[senderId] = pc;
-            pendingCandidatesRef.current[senderId] = [];
-
             upsertConnectedClient(senderId, {
               lastTelemetryAt: Date.now(),
             });
@@ -1085,113 +1063,50 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
               `AUTO-HANDSHAKE: MENERIMA OFFER DARI KLIEN (${senderId})...`
             );
 
-            // Kirim ICE Candidate Master kembali ke Klien `senderId`
-            pc.onicecandidate = (iceEvent) => {
-              if (iceEvent.candidate && ws.readyState === WebSocket.OPEN) {
-                ws.send(
-                  JSON.stringify({
-                    type: 'candidate',
-                    role: 'master',
-                    senderId: 'master',
-                    target: senderId,
-                    candidate: iceEvent.candidate.toJSON(),
-                  })
-                );
-              }
-            };
-
-            // 3. PENANGANAN STATE & UI MASTER SAAT `ontrack` MASUK DARI KLIEN 1..5
-            pc.ontrack = (trackEvent: RTCTrackEvent) => {
-              // Render elemen <audio autoplay playsinline> unik per senderId ke dalam DOM
-              handleIncomingAudio(trackEvent, {
-                audioId: senderId,
-                onStreamAttached: (inboundStream) => {
-                  attachWebRTCStreamToNode(senderId, inboundStream);
+            await handleIncomingOffer(
+              senderId,
+              msg.sdp as RTCSessionDescriptionInit,
+              ws,
+              {
+                maxClients: MAX_CLIENTS,
+                audioContainerId: 'audio-container',
+                onTrackAttached: (clientId, inboundStream, audioElement) => {
+                  nodeAudioElsRef.current.set(clientId, audioElement);
+                  attachWebRTCStreamToNode(clientId, inboundStream);
                   setConnectionBanner(
-                    `AUTO-CONNECTED & AUDIO LIVE: KLIEN (${senderId})`
+                    `AUTO-CONNECTED & AUDIO LIVE: KLIEN (${clientId})`
                   );
+                },
+                onDataChannelOpen: (clientId, channel) => {
+                  nativeDataChannelsRef.current[clientId] = channel;
+                },
+                onDataChannelMessage: (_clientId, data) => {
+                  if (data && typeof data === 'object') {
+                    handleIncomingTelemetry(data as TelemetryPayload);
+                  }
+                },
+                onClientConnected: (clientId) => {
+                  setConnectionBanner(
+                    `RTCPeerConnection ACTIVE: KLIEN (${clientId})`
+                  );
+                },
+                onClientDisconnected: (clientId) => {
+                  removeDisconnectedClient(clientId);
                 },
                 onAutoplaySuccess: () => setAutoplayBlocked(false),
                 onAutoplayBlocked: () => setAutoplayBlocked(true),
-              });
-            };
-
-            // Tangkap RTCDataChannel dari Klien untuk telemetri GPS & remote control
-            pc.ondatachannel = (dcEvent) => {
-              const dc = dcEvent.channel;
-              nativeDataChannelsRef.current[senderId] = dc;
-              dc.onmessage = (msgEv) => {
-                try {
-                  const parsed = JSON.parse(msgEv.data) as TelemetryPayload;
-                  handleIncomingTelemetry(parsed);
-                } catch {}
-              };
-            };
-
-            pc.onconnectionstatechange = () => {
-              const st = pc.connectionState;
-              if (st === 'connected') {
-                setConnectionBanner(
-                  `RTCPeerConnection ACTIVE: KLIEN (${senderId})`
-                );
-              } else if (st === 'failed' || st === 'closed' || st === 'disconnected') {
-                if (peerConnections[senderId] === pc) {
-                  delete peerConnections[senderId];
-                  delete nativeDataChannelsRef.current[senderId];
-                  removeDisconnectedClient(senderId);
-                }
-              }
-            };
-
-            try {
-              // c. Simpan RemoteDescription dan otomatis kirim balik Answer
-              await pc.setRemoteDescription(
-                new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit)
-              );
-
-              // Tambahkan ICE candidate yang sempat masuk sebelum RemoteDescription siap
-              const queued = pendingCandidatesRef.current[senderId] || [];
-              while (queued.length > 0) {
-                const cand = queued.shift();
-                if (cand) {
-                  await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-                }
-              }
-
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-
-              if (ws.readyState === WebSocket.OPEN && pc.localDescription) {
-                ws.send(
-                  JSON.stringify({
-                    type: 'answer',
-                    role: 'master',
-                    senderId: 'master',
-                    target: senderId,
-                    sdp: {
-                      type: pc.localDescription.type,
-                      sdp: pc.localDescription.sdp,
-                    },
-                  })
-                );
-              }
-            } catch {}
+              },
+              RTC_CONFIG
+            );
             return;
           }
 
-          // D. Tangani ICE Candidate dari Klien `senderId`
+          // D. Tangani ICE Candidate spesifik untuk `senderId` melalui `handleIncomingIce`
           if (msg.type === 'candidate' && senderId && msg.candidate) {
-            const pc = peerConnections[senderId];
-            if (!pc) return;
-            const candidateInit = msg.candidate as RTCIceCandidateInit;
-            if (pc.remoteDescription && pc.remoteDescription.type) {
-              await pc.addIceCandidate(new RTCIceCandidate(candidateInit)).catch(() => {});
-            } else {
-              if (!pendingCandidatesRef.current[senderId]) {
-                pendingCandidatesRef.current[senderId] = [];
-              }
-              pendingCandidatesRef.current[senderId].push(candidateInit);
-            }
+            await handleIncomingIce(
+              senderId,
+              msg.candidate as RTCIceCandidateInit
+            );
           }
         };
 
@@ -1220,12 +1135,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           wsRef.current.close();
         } catch {}
       }
-      Object.keys(peerConnections).forEach((id) => {
-        try {
-          peerConnections[id].close();
-        } catch {}
-        delete peerConnections[id];
-      });
+      cleanupAllClientConnections();
     };
   }, [
     attachWebRTCStreamToNode,
@@ -1633,7 +1543,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         }}
       />
 
-      {/* Dedicated DOM container untuk menampung elemen <audio id="audio-client-{clientId}" autoplay playsinline> unik per Klien */}
+      {/* Dedicated DOM containers untuk menampung elemen <audio id="audio-{clientId}" autoplay playsinline> unik per Klien */}
+      <div id="audio-container" />
       <div id="master-multi-audio-stage" />
 
       {/* Hidden audio element for Recordings Log playback */}
