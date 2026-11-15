@@ -217,31 +217,86 @@ function createTacticalMarkerIcon(client: ConnectedClient): L.DivIcon {
   });
 }
 
+const LOCK_RADIUS_KM = 20;
+const LOCK_RADIUS_METERS = 20000; // 20 km radius (20,000 meters)
+
+function getRadiusBounds(
+  center: [number, number],
+  radiusKm: number = LOCK_RADIUS_KM
+): L.LatLngBounds {
+  const [lat, lng] = center;
+  const deltaLat = radiusKm / 111.32;
+  const cosLat = Math.max(0.1, Math.cos((lat * Math.PI) / 180));
+  const deltaLng = radiusKm / (111.32 * cosLat);
+  return L.latLngBounds(
+    [lat - deltaLat, lng - deltaLng],
+    [lat + deltaLat, lng + deltaLng]
+  );
+}
+
 const MapViewportController: React.FC<{
   center: [number, number];
   zoom: number;
-}> = ({ center, zoom }) => {
+  hasClientGps: boolean;
+}> = ({ center, hasClientGps }) => {
   const map = useMap();
   const prevCenterRef = useRef<string>('');
 
+  const apply20KmRadiusLock = useCallback(
+    (animateView: boolean) => {
+      const bounds20km = getRadiusBounds(center, LOCK_RADIUS_KM);
+      // Lock map panning strictly within 20 km radius from center GPS client
+      map.setMaxBounds(bounds20km.pad(0.04));
+      map.options.maxBoundsViscosity = 1.0;
+
+      const fitZoom = map.getBoundsZoom(bounds20km, false);
+      const lockedMinZoom = Math.max(10, fitZoom);
+      map.setMinZoom(lockedMinZoom);
+      map.setMaxZoom(18);
+
+      map.fitBounds(bounds20km, {
+        animate: animateView,
+        padding: [14, 14],
+      });
+    },
+    [center, map]
+  );
+
   useEffect(() => {
-    const key = `${center[0].toFixed(4)},${center[1].toFixed(4)},${zoom}`;
+    const key = `${center[0].toFixed(4)},${center[1].toFixed(4)},${
+      hasClientGps ? 'CLIENT_LOCK' : 'MASTER_DEFAULT'
+    }`;
     if (prevCenterRef.current !== key) {
       prevCenterRef.current = key;
-      map.setView(center, zoom, { animate: true });
+      apply20KmRadiusLock(true);
+    } else {
+      const bounds20km = getRadiusBounds(center, LOCK_RADIUS_KM);
+      map.setMaxBounds(bounds20km.pad(0.04));
+      map.options.maxBoundsViscosity = 1.0;
     }
-  }, [center, zoom, map]);
+  }, [apply20KmRadiusLock, center, hasClientGps, map]);
 
   return (
-    <button
-      type="button"
-      onClick={() => map.setView(center, zoom, { animate: true })}
-      className="absolute bottom-8 right-3 z-[500] flex items-center gap-1 px-2.5 py-1 text-[10px] font-mono-tactical bg-[#040d1a]/90 border border-cyan-500/50 text-cyan-300 rounded hover:bg-cyan-500/20 transition-colors cursor-pointer"
-      title="Recenter Tactical Map"
-    >
-      <Crosshair className="w-3 h-3 text-cyan-400" />
-      <span>RECENTER HUD</span>
-    </button>
+    <div className="absolute bottom-8 right-3 z-[500] flex items-center gap-1.5">
+      <button
+        type="button"
+        onClick={() => map.setView(center, 15, { animate: true })}
+        className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-mono-tactical bg-[#040d1a]/90 border border-emerald-500/50 text-emerald-300 rounded hover:bg-emerald-500/20 transition-colors cursor-pointer"
+        title="Zoom ke Titik Pin GPS Client"
+      >
+        <Crosshair className="w-3 h-3 text-emerald-400" />
+        <span>ZOOM PIN</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => apply20KmRadiusLock(true)}
+        className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-mono-tactical bg-[#040d1a]/90 border border-cyan-500/50 text-cyan-300 rounded hover:bg-cyan-500/20 transition-colors cursor-pointer"
+        title="Lock Map pada Radius 20 KM dari Center GPS Client"
+      >
+        <Crosshair className="w-3 h-3 text-cyan-400" />
+        <span>LOCK 20KM RADIUS</span>
+      </button>
+    </div>
   );
 };
 
@@ -1088,9 +1143,317 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   useEffect(() => {
     let isMounted = true;
     let reconnectTimer: number | null = null;
+    let httpPollTimer: number | null = null;
     const pcMap = peerConnections.current;
     const dcMap = nativeDataChannelsRef.current;
     const candQueueMap = pendingCandidatesRef.current;
+    const lastOfferSdpMap = new Map<string, { sdp: string; at: number }>();
+
+    const sendToClientSignaling = (packet: Record<string, unknown>) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(JSON.stringify(packet));
+        } catch {}
+      }
+      void fetch('/api/signal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(packet),
+      }).catch(() => {});
+    };
+
+    const handleMasterSignalingData = async (data: Record<string, unknown>) => {
+      if (!isMounted || !data || typeof data.type !== 'string') return;
+
+      const senderId = String(
+        data.senderId || data.id || data.clientId || data.nodeId || ''
+      ).replace('sigma-node-', '');
+
+      if (!senderId || senderId.toUpperCase() === 'MASTER') return;
+
+      // A0. Tangani Registrasi Klien Baru (`client_registered`) agar Samsung/Oppo langsung muncul di Dashboard
+      if (data.type === 'client_registered') {
+        handlersRef.current.upsertConnectedClient(senderId, {
+          lastTelemetryAt: Date.now(),
+        });
+        setConnectionBanner(
+          `KLIEN TERHUBUNG KE MASTER: (${senderId}) · MENYIAPKAN STREAM AUDIO...`
+        );
+        sendToClientSignaling({
+          type: 'master_ack',
+          senderId: 'MASTER',
+          targetId: senderId,
+        });
+        return;
+      }
+
+      // A. Tangani Paket Telemetri GPS dari Klien
+      if (data.type === 'SIGMA_TELEMETRY') {
+        handlersRef.current.handleIncomingTelemetry(
+          data as unknown as TelemetryPayload
+        );
+        sendToClientSignaling({
+          type: 'master_ack',
+          senderId: 'MASTER',
+          targetId: senderId,
+        });
+        return;
+      }
+
+      // A2. Tangani Stream Audio Fallback via WebSocket (`SIGMA_WS_AUDIO`) untuk Samsung/Oppo
+      if (data.type === 'SIGMA_WS_AUDIO' && Array.isArray(data.samples)) {
+        try {
+          const ctx = getAudioContext();
+          let destNode = wsAudioStreamRef.current.get(senderId);
+          if (!destNode) {
+            destNode = ctx.createMediaStreamDestination();
+            wsAudioStreamRef.current.set(senderId, destNode);
+            handlersRef.current.attachWebRTCStreamToNode(
+              senderId,
+              destNode.stream
+            );
+          }
+          const samples = data.samples as number[];
+          const sampleRate = Number(data.sampleRate) || 16000;
+          if (samples.length > 0) {
+            const audioBuffer = ctx.createBuffer(
+              1,
+              samples.length,
+              sampleRate
+            );
+            const channelData = audioBuffer.getChannelData(0);
+            for (let i = 0; i < samples.length; i++) {
+              channelData[i] = samples[i] / 32768;
+            }
+            const bufferSource = ctx.createBufferSource();
+            bufferSource.buffer = audioBuffer;
+            bufferSource.connect(destNode);
+
+            const now = ctx.currentTime;
+            const prevPlayhead =
+              wsAudioPlayheadRef.current.get(senderId) || 0;
+            const startAt =
+              prevPlayhead > now && prevPlayhead - now < 0.6
+                ? prevPlayhead
+                : now + 0.02;
+            bufferSource.start(startAt);
+            wsAudioPlayheadRef.current.set(
+              senderId,
+              startAt + audioBuffer.duration
+            );
+          }
+        } catch {}
+        return;
+      }
+
+      // B. Tangani Notifikasi Putusnya Klien spesifik (`senderId`)
+      if (
+        data.type === 'client_disconnected' ||
+        data.type === 'CLIENT_DISCONNECTED'
+      ) {
+        const oldPc = pcMap.get(senderId);
+        if (oldPc) {
+          try {
+            oldPc.close();
+          } catch {}
+          pcMap.delete(senderId);
+        }
+        dcMap.delete(senderId);
+        candQueueMap.delete(senderId);
+        lastOfferSdpMap.delete(senderId);
+        wsAudioStreamRef.current.delete(senderId);
+        wsAudioPlayheadRef.current.delete(senderId);
+        handlersRef.current.removeDisconnectedClient(senderId);
+        return;
+      }
+
+      // C. Terima SDP OFFER dari Klien (`{ type: "offer", senderId, targetId: "MASTER", data: offer }`)
+      const offerPayload = (data.data || data.sdp) as
+        | RTCSessionDescriptionInit
+        | undefined;
+      if (
+        (data.type === 'offer' || data.type === 'OFFER') &&
+        offerPayload &&
+        offerPayload.sdp
+      ) {
+        // Cegah duplikasi Offer identik dari jalur ganda (WebSocket + HTTP /api/signal)
+        const prevOffer = lastOfferSdpMap.get(senderId);
+        if (
+          prevOffer &&
+          prevOffer.sdp === offerPayload.sdp &&
+          Date.now() - prevOffer.at < 3000
+        ) {
+          return;
+        }
+        lastOfferSdpMap.set(senderId, {
+          sdp: offerPayload.sdp,
+          at: Date.now(),
+        });
+
+        const isExisting =
+          pcMap.has(senderId) ||
+          clientsRef.current.some((c) => c.nodeId === senderId);
+
+        if (!isExisting && pcMap.size >= MAX_CLIENTS) {
+          return;
+        }
+
+        const prevPc = pcMap.get(senderId);
+        if (prevPc) {
+          try {
+            prevPc.ontrack = null;
+            prevPc.onicecandidate = null;
+            prevPc.ondatachannel = null;
+            prevPc.oniceconnectionstatechange = null;
+            prevPc.onconnectionstatechange = null;
+            prevPc.close();
+          } catch {}
+          pcMap.delete(senderId);
+        }
+
+        const pc = new RTCPeerConnection(RTC_CONFIG);
+        pcMap.set(senderId, pc);
+        remoteDescReadyRef.current.set(senderId, false);
+        if (!candQueueMap.has(senderId)) {
+          candQueueMap.set(senderId, []);
+        }
+
+        handlersRef.current.upsertConnectedClient(senderId, {
+          lastTelemetryAt: Date.now(),
+        });
+        setConnectionBanner(
+          `HANDSHAKE MULTI-PEER: MENERIMA OFFER DARI (${senderId}) · TOTAL: ${pcMap.size} KLIEN`
+        );
+
+        // Kirim ICE Candidate Master kembali spesifik ke `targetId: senderId`
+        pc.onicecandidate = (iceEvent) => {
+          if (iceEvent.candidate && iceEvent.candidate.candidate) {
+            const candidateJson = iceEvent.candidate.toJSON();
+            const candidatePacket = {
+              type: 'candidate',
+              senderId: 'MASTER',
+              targetId: senderId,
+              data: candidateJson,
+            };
+            sendToClientSignaling(candidatePacket);
+          }
+        };
+
+        // Saat `ontrack` dari Klien masuk, tambahkan `{ id: senderId, stream }` ke `clientStreams`
+        pc.ontrack = (trackEvent: RTCTrackEvent) => {
+          const inboundStream =
+            trackEvent.streams && trackEvent.streams[0]
+              ? trackEvent.streams[0]
+              : new MediaStream([trackEvent.track]);
+
+          setClientStreams((prev) => {
+            const exists = prev.some((item) => item.id === senderId);
+            if (exists) {
+              return prev.map((item) =>
+                item.id === senderId
+                  ? { id: senderId, stream: inboundStream }
+                  : item
+              );
+            }
+            return [...prev, { id: senderId, stream: inboundStream }];
+          });
+
+          handlersRef.current.attachWebRTCStreamToNode(
+            senderId,
+            inboundStream
+          );
+          setConnectionBanner(
+            `MULTI-PEER AUDIO AKTIF: KLIEN (${senderId})`
+          );
+        };
+
+        // Tangkap RTCDataChannel untuk GPS spesifik per `senderId`
+        pc.ondatachannel = (dcEvent) => {
+          const channel = dcEvent.channel;
+          dcMap.set(senderId, channel);
+          channel.onmessage = (msgEv) => {
+            try {
+              const parsed = JSON.parse(msgEv.data) as TelemetryPayload;
+              handlersRef.current.handleIncomingTelemetry(parsed);
+            } catch {}
+          };
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          if (pcMap.get(senderId) !== pc) return;
+          const st = pc.iceConnectionState;
+          if (st === 'connected' || st === 'completed') {
+            handlersRef.current.upsertConnectedClient(senderId, {
+              hasAudioStream: true,
+              lastTelemetryAt: Date.now(),
+            });
+          } else if (st === 'failed' || st === 'closed') {
+            pcMap.delete(senderId);
+            dcMap.delete(senderId);
+            candQueueMap.delete(senderId);
+            remoteDescReadyRef.current.delete(senderId);
+          }
+        };
+
+        try {
+          await pc.setRemoteDescription(offerPayload);
+          remoteDescReadyRef.current.set(senderId, true);
+
+          const candidateQueue = candQueueMap.get(senderId) || [];
+          while (candidateQueue.length > 0) {
+            const nextCand = candidateQueue.shift();
+            if (nextCand && nextCand.candidate) {
+              await pc.addIceCandidate(nextCand).catch(() => {});
+            }
+          }
+
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          if (pc.localDescription) {
+            const answerPacket = {
+              type: 'answer',
+              senderId: 'MASTER',
+              targetId: senderId,
+              data: {
+                type: pc.localDescription.type,
+                sdp: pc.localDescription.sdp,
+              },
+            };
+            sendToClientSignaling(answerPacket);
+          }
+        } catch (err) {
+          console.error(
+            `[MASTER-WS] Gagal memproses Offer dari "${senderId}":`,
+            err
+          );
+        }
+        return;
+      }
+
+      // D. ICE CANDIDATE QUEUEING (PENCEGAH RACE CONDITION):
+      const candidatePayload = (data.data || data.candidate) as
+        | RTCIceCandidateInit
+        | undefined;
+      if (
+        (data.type === 'candidate' || data.type === 'ICE_CANDIDATE') &&
+        candidatePayload &&
+        candidatePayload.candidate
+      ) {
+        const pc = pcMap.get(senderId);
+        const isRemoteReady =
+          Boolean(pc && pc.remoteDescription && pc.remoteDescription.type) &&
+          remoteDescReadyRef.current.get(senderId) === true;
+
+        if (pc && isRemoteReady) {
+          await pc.addIceCandidate(candidatePayload).catch(() => {});
+        } else {
+          const candidateQueue = candQueueMap.get(senderId) || [];
+          candidateQueue.push(candidatePayload);
+          candQueueMap.set(senderId, candidateQueue);
+        }
+      }
+    };
 
     const connectMasterWebSocket = () => {
       if (!isMounted) return;
@@ -1112,7 +1475,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             type: 'register',
             id: 'MASTER',
           };
-          console.log('[MASTER-WS] WebSocket terbuka. Mengirim registrasi:', regPayload);
           ws.send(JSON.stringify(regPayload));
           setConnectionBanner(
             'MASTER ONLINE (ID: MASTER) · SIAP MENERIMA HINGGA 5 KLIEN BERSAMAAN'
@@ -1121,357 +1483,10 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
         ws.onmessage = async (event) => {
           if (!isMounted) return;
-          let data: Record<string, unknown> | null = null;
           try {
-            data = JSON.parse(event.data) as Record<string, unknown>;
-          } catch (err) {
-            console.error('[MASTER-WS] Gagal parse pesan JSON:', err);
-            return;
-          }
-          if (!data || typeof data.type !== 'string') return;
-
-          const senderId = String(
-            data.senderId || data.id || data.clientId || data.nodeId || ''
-          ).replace('sigma-node-', '');
-
-          console.log(
-            `[MASTER-WS] Menerima pesan -> type: "${data.type}", senderId: "${senderId}", targetId: "${
-              data.targetId || ''
-            }"`
-          );
-
-          if (!senderId || senderId.toUpperCase() === 'MASTER') return;
-
-          // A0. Tangani Registrasi Klien Baru (`client_registered`) agar Samsung/Oppo langsung muncul di Dashboard
-          if (data.type === 'client_registered') {
-            handlersRef.current.upsertConnectedClient(senderId, {
-              lastTelemetryAt: Date.now(),
-            });
-            setConnectionBanner(
-              `KLIEN TERHUBUNG KE SIGNALING: (${senderId}) · MENYIAPKAN STREAM AUDIO...`
-            );
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(
-                JSON.stringify({
-                  type: 'master_ack',
-                  senderId: 'MASTER',
-                  targetId: senderId,
-                })
-              );
-            }
-            return;
-          }
-
-          // A. Tangani Paket Telemetri GPS dari Klien
-          if (data.type === 'SIGMA_TELEMETRY') {
-            handlersRef.current.handleIncomingTelemetry(
-              data as unknown as TelemetryPayload
-            );
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(
-                JSON.stringify({
-                  type: 'master_ack',
-                  senderId: 'MASTER',
-                  targetId: senderId,
-                })
-              );
-            }
-            return;
-          }
-
-          // A2. Tangani Stream Audio Fallback via WebSocket (`SIGMA_WS_AUDIO`) untuk Samsung/Oppo
-          // apabila jalur UDP WebRTC terhalang CGNAT / Firewall operator seluler
-          if (data.type === 'SIGMA_WS_AUDIO' && Array.isArray(data.samples)) {
-            try {
-              const ctx = getAudioContext();
-              let destNode = wsAudioStreamRef.current.get(senderId);
-              if (!destNode) {
-                destNode = ctx.createMediaStreamDestination();
-                wsAudioStreamRef.current.set(senderId, destNode);
-                handlersRef.current.attachWebRTCStreamToNode(
-                  senderId,
-                  destNode.stream
-                );
-              }
-              const samples = data.samples as number[];
-              const sampleRate = Number(data.sampleRate) || 16000;
-              if (samples.length > 0) {
-                const audioBuffer = ctx.createBuffer(
-                  1,
-                  samples.length,
-                  sampleRate
-                );
-                const channelData = audioBuffer.getChannelData(0);
-                for (let i = 0; i < samples.length; i++) {
-                  channelData[i] = samples[i] / 32768;
-                }
-                const bufferSource = ctx.createBufferSource();
-                bufferSource.buffer = audioBuffer;
-                bufferSource.connect(destNode);
-
-                const now = ctx.currentTime;
-                const prevPlayhead =
-                  wsAudioPlayheadRef.current.get(senderId) || 0;
-                const startAt =
-                  prevPlayhead > now && prevPlayhead - now < 0.6
-                    ? prevPlayhead
-                    : now + 0.02;
-                bufferSource.start(startAt);
-                wsAudioPlayheadRef.current.set(
-                  senderId,
-                  startAt + audioBuffer.duration
-                );
-              }
-            } catch {}
-            return;
-          }
-
-          // B. Tangani Notifikasi Putusnya Klien spesifik (`senderId`)
-          if (
-            data.type === 'client_disconnected' ||
-            data.type === 'CLIENT_DISCONNECTED'
-          ) {
-            console.log(`[MASTER-WS] Klien "${senderId}" terputus. Membersihkan slot.`);
-            const oldPc = pcMap.get(senderId);
-            if (oldPc) {
-              try {
-                oldPc.close();
-              } catch {}
-              pcMap.delete(senderId);
-            }
-            dcMap.delete(senderId);
-            candQueueMap.delete(senderId);
-            wsAudioStreamRef.current.delete(senderId);
-            wsAudioPlayheadRef.current.delete(senderId);
-            handlersRef.current.removeDisconnectedClient(senderId);
-            return;
-          }
-
-          // C. Terima SDP OFFER dari Klien (`{ type: "offer", senderId, targetId: "MASTER", data: offer }`)
-          const offerPayload = (data.data || data.sdp) as
-            | RTCSessionDescriptionInit
-            | undefined;
-          if (
-            (data.type === 'offer' || data.type === 'OFFER') &&
-            offerPayload
-          ) {
-            const isExisting =
-              pcMap.has(senderId) ||
-              clientsRef.current.some((c) => c.nodeId === senderId);
-
-            if (!isExisting && pcMap.size >= MAX_CLIENTS) {
-              console.warn(
-                `[MASTER-WS] Menolak Offer dari "${senderId}" karena slot penuh (${MAX_CLIENTS} Klien).`
-              );
-              return;
-            }
-
-            // Jika senderId yang sama melakukan re-offer, tutup sesi lamanya saja (bukan Klien lain)
-            const prevPc = pcMap.get(senderId);
-            if (prevPc) {
-              try {
-                prevPc.ontrack = null;
-                prevPc.onicecandidate = null;
-                prevPc.ondatachannel = null;
-                prevPc.oniceconnectionstatechange = null;
-                prevPc.onconnectionstatechange = null;
-                prevPc.close();
-              } catch {}
-              pcMap.delete(senderId);
-            }
-
-            console.log(
-              `[MASTER-WS] Membuat RTCPeerConnection baru untuk senderId="${senderId}"`
-            );
-            const pc = new RTCPeerConnection(RTC_CONFIG);
-            // Simpan di dalam `peerConnections.current` (Map di dalam useRef)
-            pcMap.set(senderId, pc);
-            // Tandai bahwa remoteDescription belum selesai diset (cegah race condition ICE Candidate)
-            remoteDescReadyRef.current.set(senderId, false);
-            if (!candQueueMap.has(senderId)) {
-              candQueueMap.set(senderId, []);
-            }
-
-            handlersRef.current.upsertConnectedClient(senderId, {
-              lastTelemetryAt: Date.now(),
-            });
-            setConnectionBanner(
-              `HANDSHAKE MULTI-PEER: MENERIMA OFFER DARI (${senderId}) · TOTAL: ${pcMap.size} KLIEN`
-            );
-
-            // Kirim ICE Candidate Master kembali spesifik ke `targetId: senderId`
-            pc.onicecandidate = (iceEvent) => {
-              if (iceEvent.candidate && ws.readyState === WebSocket.OPEN) {
-                const candidateJson = iceEvent.candidate.toJSON();
-                const candidatePacket = {
-                  type: 'candidate',
-                  senderId: 'MASTER',
-                  targetId: senderId,
-                  data: candidateJson,
-                };
-                console.log(
-                  `[MASTER-WS] Mengirim ICE Candidate ke targetId="${senderId}"`
-                );
-                ws.send(JSON.stringify(candidatePacket));
-              }
-            };
-
-            // Saat `ontrack` dari Klien masuk, tambahkan `{ id: senderId, stream }` ke `clientStreams`
-            pc.ontrack = (trackEvent: RTCTrackEvent) => {
-              console.log(
-                `[MASTER-WS] EVENT ontrack DITERIMA dari senderId="${senderId}"! Track kind="${trackEvent.track.kind}"`
-              );
-              const inboundStream =
-                trackEvent.streams && trackEvent.streams[0]
-                  ? trackEvent.streams[0]
-                  : new MediaStream([trackEvent.track]);
-
-              setClientStreams((prev) => {
-                const exists = prev.some((item) => item.id === senderId);
-                if (exists) {
-                  return prev.map((item) =>
-                    item.id === senderId
-                      ? { id: senderId, stream: inboundStream }
-                      : item
-                  );
-                }
-                return [...prev, { id: senderId, stream: inboundStream }];
-              });
-
-              handlersRef.current.attachWebRTCStreamToNode(
-                senderId,
-                inboundStream
-              );
-              setConnectionBanner(
-                `MULTI-PEER AUDIO AKTIF: KLIEN (${senderId})`
-              );
-            };
-
-            // Tangkap RTCDataChannel untuk GPS spesifik per `senderId`
-            pc.ondatachannel = (dcEvent) => {
-              console.log(
-                `[MASTER-WS] DataChannel terbuka dari senderId="${senderId}"`
-              );
-              const channel = dcEvent.channel;
-              dcMap.set(senderId, channel);
-              channel.onmessage = (msgEv) => {
-                try {
-                  const parsed = JSON.parse(msgEv.data) as TelemetryPayload;
-                  handlersRef.current.handleIncomingTelemetry(parsed);
-                } catch {}
-              };
-            };
-
-            // Cleanup sesi RTCPeerConnection jika ICE gagal, TANPA menghapus Klien dari dashboard
-            // selama WebSocket Klien tersebut masih aktif (agar Samsung/Oppo tetap terhubung & bisa re-offer)
-            pc.oniceconnectionstatechange = () => {
-              if (pcMap.get(senderId) !== pc) return;
-              const st = pc.iceConnectionState;
-              console.log(
-                `[MASTER-WS] iceConnectionState untuk "${senderId}": ${st}`
-              );
-              if (st === 'connected' || st === 'completed') {
-                handlersRef.current.upsertConnectedClient(senderId, {
-                  hasAudioStream: true,
-                  lastTelemetryAt: Date.now(),
-                });
-              } else if (st === 'failed' || st === 'closed') {
-                pcMap.delete(senderId);
-                dcMap.delete(senderId);
-                candQueueMap.delete(senderId);
-                remoteDescReadyRef.current.delete(senderId);
-              }
-            };
-
-            try {
-              await pc.setRemoteDescription(
-                new RTCSessionDescription(offerPayload)
-              );
-              // Setelah setRemoteDescription() selesai dieksekusi (resolved promise),
-              // tandai siap dan masukkan semua candidate yang sempat tertahan di antrean
-              remoteDescReadyRef.current.set(senderId, true);
-
-              const candidateQueue = candQueueMap.get(senderId) || [];
-              while (candidateQueue.length > 0) {
-                const nextCand = candidateQueue.shift();
-                if (nextCand) {
-                  console.log(
-                    `[MASTER-WS] Memasukkan ICE Candidate dari antrean untuk "${senderId}"`
-                  );
-                  await pc
-                    .addIceCandidate(new RTCIceCandidate(nextCand))
-                    .catch((err) => {
-                      console.error(
-                        `[MASTER-WS] Gagal addIceCandidate dari antrean untuk "${senderId}":`,
-                        err
-                      );
-                    });
-                }
-              }
-
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-
-              if (ws.readyState === WebSocket.OPEN && pc.localDescription) {
-                const answerPacket = {
-                  type: 'answer',
-                  senderId: 'MASTER',
-                  targetId: senderId,
-                  data: {
-                    type: pc.localDescription.type,
-                    sdp: pc.localDescription.sdp,
-                  },
-                };
-                console.log(
-                  `[MASTER-WS] Mengirim ANSWER balik ke targetId="${senderId}"`
-                );
-                ws.send(JSON.stringify(answerPacket));
-              }
-            } catch (err) {
-              console.error(
-                `[MASTER-WS] Gagal memproses Offer dari "${senderId}":`,
-                err
-              );
-            }
-            return;
-          }
-
-          // D. ICE CANDIDATE QUEUEING (PENCEGAH RACE CONDITION):
-          // Saat menerima pesan { type: "candidate" } dari WebSocket, JANGAN langsung memanggil
-          // peerConnection.addIceCandidate() sebelum remoteDescription siap.
-          const candidatePayload = (data.data || data.candidate) as
-            | RTCIceCandidateInit
-            | undefined;
-          if (
-            (data.type === 'candidate' || data.type === 'ICE_CANDIDATE') &&
-            candidatePayload
-          ) {
-            const pc = pcMap.get(senderId);
-            const isRemoteReady =
-              Boolean(pc && pc.remoteDescription && pc.remoteDescription.type) &&
-              remoteDescReadyRef.current.get(senderId) === true;
-
-            if (pc && isRemoteReady) {
-              console.log(
-                `[MASTER-WS] Menambahkan ICE Candidate langsung ke peerConnections.get("${senderId}")`
-              );
-              await pc
-                .addIceCandidate(new RTCIceCandidate(candidatePayload))
-                .catch((err) => {
-                  console.error(
-                    `[MASTER-WS] Gagal addIceCandidate untuk "${senderId}":`,
-                    err
-                  );
-                });
-            } else {
-              console.log(
-                `[MASTER-WS] Mengantrekan ICE Candidate untuk "${senderId}" ke candidateQueue (remoteDescription belum siap)`
-              );
-              const candidateQueue = candQueueMap.get(senderId) || [];
-              candidateQueue.push(candidatePayload);
-              candQueueMap.set(senderId, candidateQueue);
-            }
-          }
+            const data = JSON.parse(event.data) as Record<string, unknown>;
+            await handleMasterSignalingData(data);
+          } catch {}
         };
 
         ws.onclose = () => {
@@ -1491,9 +1506,28 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
     connectMasterWebSocket();
 
+    // Polling HTTP /api/signal/MASTER setiap 2 detik untuk menerima sinyal dari HP Samsung bila WS terhambat
+    httpPollTimer = window.setInterval(async () => {
+      if (!isMounted) return;
+      try {
+        const res = await fetch('/api/signal/MASTER');
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          ok?: boolean;
+          messages?: Record<string, unknown>[];
+        };
+        if (Array.isArray(json.messages)) {
+          for (const msg of json.messages) {
+            await handleMasterSignalingData(msg);
+          }
+        }
+      } catch {}
+    }, 2000);
+
     return () => {
       isMounted = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (httpPollTimer) clearInterval(httpPollTimer);
       if (wsRef.current) {
         try {
           wsRef.current.close();
@@ -1508,7 +1542,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       dcMap.clear();
       candQueueMap.clear();
     };
-  }, []);
+  }, [getAudioContext]);
 
   // Initialize Master PeerJS Broker (Fallback layer dengan ID tetap `sigma-master-main`)
   useEffect(() => {
@@ -2504,10 +2538,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                 <span className="font-bold text-cyan-300">MGRS TACTICAL GRID</span>
                 <span>CONNECTED: {connectedClients.length}/05</span>
                 <span>GPS PINS: {connectedWithGps.length}</span>
+                <span className="text-amber-300 font-semibold">
+                  MAP LOCK: RADIUS 20 KM
+                </span>
               </div>
               <div className="hidden sm:flex items-center gap-3">
                 <span className="text-emerald-400 font-semibold">
-                  WEBRTC DATA CHANNEL: REAL-TIME ONLY
+                  20 KM PERIMETER LOCKED TO CLIENT GPS CENTER
                 </span>
               </div>
             </div>
@@ -2520,10 +2557,10 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                   </div>
                   <div className="text-[10px] text-slate-400 mt-0.5">
                     {masterCoords.hasLock
-                      ? `MASTER GPS CENTER: ${masterCoords.lat.toFixed(
+                      ? `MASTER GPS CENTER (20 KM LOCK): ${masterCoords.lat.toFixed(
                           5
                         )}°, ${masterCoords.lng.toFixed(5)}°`
-                      : 'DEFAULT INDONESIA CENTER · MENUNGGU PAKET KOORDINAT WEBRTC'}
+                      : 'DEFAULT INDONESIA CENTER · MENUNGGU PAKET KOORDINAT CLIENT'}
                   </div>
                 </div>
               </div>
@@ -2532,7 +2569,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             {connectedWithGps.length > 0 && (
               <div className="absolute top-8 left-3 z-[450] bg-[#030914]/85 border border-cyan-500/30 rounded p-2 text-[10px] leading-relaxed text-slate-300 pointer-events-none">
                 <div className="text-cyan-300 font-semibold">
-                  PRIMARY: {connectedWithGps[0].label} ({connectedWithGps[0].nodeId})
+                  CENTER LOCK (20 KM): {connectedWithGps[0].label} (
+                  {connectedWithGps[0].nodeId})
                 </div>
                 <div>LAT: {connectedWithGps[0].lat!.toFixed(6)}°</div>
                 <div>LNG: {connectedWithGps[0].lng!.toFixed(6)}°</div>
@@ -2576,12 +2614,29 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             <MapContainer
               center={activeMapCenter}
               zoom={activeMapZoom}
+              minZoom={10}
+              maxZoom={18}
+              maxBounds={getRadiusBounds(activeMapCenter, LOCK_RADIUS_KM).pad(0.04)}
+              maxBoundsViscosity={1.0}
               zoomControl={false}
               className="w-full h-full min-h-[380px] sigma-leaflet-map z-[400]"
             >
               <TileLayer
                 url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
                 attribution="Tiles &copy; Esri &mdash; Source: Esri, USDA, USGS"
+              />
+
+              {/* Lingkaran Perimeter Penguncian Peta Radius 20 KM (20,000 meter) dari Center GPS Client */}
+              <Circle
+                center={activeMapCenter}
+                radius={LOCK_RADIUS_METERS}
+                pathOptions={{
+                  color: '#00FFFF',
+                  fillColor: '#00FFFF',
+                  fillOpacity: 0.03,
+                  weight: 1.5,
+                  dashArray: '8 6',
+                }}
               />
 
               {polylineCoords.length > 1 && (
@@ -2615,12 +2670,17 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                 </React.Fragment>
               ))}
 
-              <MapViewportController center={activeMapCenter} zoom={activeMapZoom} />
+              <MapViewportController
+                center={activeMapCenter}
+                zoom={activeMapZoom}
+                hasClientGps={connectedWithGps.length > 0}
+              />
             </MapContainer>
 
             <div className="absolute bottom-0 inset-x-0 z-[450] bg-gradient-to-t from-[#02060d]/95 via-[#02060d]/75 to-transparent px-3 py-1 flex items-center justify-between text-[10px] text-cyan-300/70 pointer-events-none">
               <span>
-                CENTER: {activeMapCenter[0].toFixed(4)}°, {activeMapCenter[1].toFixed(4)}°
+                LOCKED CENTER (20 KM RADIUS): {activeMapCenter[0].toFixed(4)}°,{' '}
+                {activeMapCenter[1].toFixed(4)}°
               </span>
               <span>SOURCE: ESRI WORLD IMAGERY</span>
               <span>ACTIVE PEERS: {connectedClients.length}</span>
